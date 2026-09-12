@@ -1,0 +1,13 @@
+[Unit]
+Description=Oakring Binance bookTicker SQLite recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/oakring/recorder.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
