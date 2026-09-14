@@ -6,8 +6,30 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
+WorkingDirectory=/home/ubuntu/oakring
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/ubuntu/oakring/recorder.py
 Restart=on-failure
+RestartSec=10
+# The recorder exits on SIGTERM after finishing the tick in flight.
+TimeoutStopSec=30
+
+# Outbound HTTPS only: no listen sockets, no privileges, nothing writable
+# outside the oakring config directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.config/oakring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
