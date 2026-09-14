@@ -87,7 +87,7 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 | `--swing` | `2.0` | Percent reversal that confirms a zigzag pivot |
 | `--auto` | off | Pick `--bucket` and `--swing` per pair from the data present |
 | `--pair` | all recorded | Repeatable |
-| `--format` | `text` | `text`, `json` (full report), `csv` (the OHLC bars) |
+| `--format` | `text` | `text`, `brief` (phone sized), `json` (full report), `csv` (the OHLC bars) |
 | `--db` | `DB_PATH` | Override the database |
 
 ### Current prices
@@ -171,6 +171,40 @@ The bucket sets the shortest cycle you can see (about 4 bars) and the window set
 | Intraday chop | `24h` | `5m` | `0.3` |
 | Daily swing | `7d` | `1h` | `2` |
 | Multi-week | `60d` | `4h` | `5` |
+
+## Two commands from a phone
+
+No laptop needed — both are one line over SSH.
+
+**Is it working?**
+
+```bash
+./check.sh
+```
+
+Services, database size, free disk, tick count, how long ago the last tick landed, the error rate over the last hour, any pair that has stalled, and the current prices. Ends in `OK - recording.` or `NEEDS ATTENTION`, and exits non-zero in the second case so cron can use it too.
+
+**The report, phone sized:**
+
+```bash
+python3 analyze.py --since 30d --auto --format brief
+```
+
+`brief` keeps every line under 40 characters so nothing wraps on a phone, and `--auto` picks the settings, so this one command works whether you have two days recorded or two months:
+
+```
+oakring  30.0d to 2026-09-14T23:22:36Z
+
+SOLUSDT  107.5547
+  move   +5.64% over 47.2h
+  range  14.47%, now 39% up it
+  cycle  ~9.2h (8 seen, 1.97% swings)
+  repeat ~9.1h [low]
+  phase  ACCUMULATION
+  data   47.2h, 0 gaps, 0.0% errors
+```
+
+`move` is measured over the data that exists, which the `data` line states outright along with gaps and errors — so a report built on a broken recording says so.
 
 ## Scheduled reports
 
@@ -290,6 +324,7 @@ python3 -m unittest discover -s tests -v
 |------|---------|
 | `recorder.py` | Poll loop: batched fetch, retries, error rows, pruning, clean shutdown |
 | `report.sh` | Writes a timestamped report; what the timer runs |
+| `check.sh` | Health check: services, freshness, errors, prices |
 | `analyze.py` | Cycle report: bars, coverage, trend, swings, periodogram, phase |
 | `common.py` | Shared config, database open/migrate, time helpers |
 | `schema.sql` | `ticks` table and indexes |

@@ -585,6 +585,24 @@ class AutoSettingsTests(TempConfigCase):
         self.assertRegex(output, r"~9\.\dh")
 
 
+class BriefFormatTests(TempConfigCase):
+    def test_brief_is_narrow_and_reports_the_recorded_span(self) -> None:
+        seed_cycle_db(self.db_path)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(
+                analyze.main(["--db", str(self.db_path), "--since", "30d", "--auto", "--format", "brief"]), 0
+            )
+        output = buffer.getvalue()
+        self.assertIn("SOLUSDT", output)
+        self.assertIn("phase", output)
+        # The move must be labelled with the data's own span, not the asked-for window.
+        self.assertNotIn("over 30.0d", output)
+        self.assertIn("over 14", output)
+        widest = max(len(line) for line in output.split("\n"))
+        self.assertLessEqual(widest, 44, "brief output must not wrap on a phone terminal")
+
+
 class CliTests(TempConfigCase):
     def test_text_json_and_csv_output(self) -> None:
         seed_cycle_db(self.db_path)

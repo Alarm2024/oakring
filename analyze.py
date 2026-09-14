@@ -450,6 +450,7 @@ def analyse_pair(bars: list[Bar], pair: str, bucket: int, swing_pct: float, wind
         ),
         "gap_count": len(gaps),
         "largest_gap_bars": max((gap["missing_bars"] for gap in gaps), default=0),
+        "recorded_span_human": common.format_duration(bars[-1].start - bars[0].start + bucket),
         "first_bar": common.to_ts_utc(common.from_epoch(bars[0].start)),
         "last_bar": common.to_ts_utc(common.from_epoch(bars[-1].start)),
     }
@@ -668,6 +669,39 @@ def render_text(report: PairReport) -> str:
     return "\n".join(lines)
 
 
+def render_brief(report: PairReport) -> str:
+    """A few narrow lines per pair - readable on a phone, no wide tables."""
+    price, coverage = report.price, report.coverage
+    lines = [f"{report.pair}  {price_fmt(price['last'])}"]
+    # The change spans the data that exists, which is rarely the whole window.
+    lines.append(f"  move   {price['change_pct']:+.2f}% over {coverage['recorded_span_human']}")
+
+    position = report.phase.get("range_position_pct")
+    where = f", now {position:.0f}% up it" if position is not None else ""
+    lines.append(f"  range  {price['range_pct']:.2f}%{where}")
+
+    swings = report.swings
+    if swings.get("mean_cycle_human"):
+        lines.append(
+            f"  cycle  ~{swings['mean_cycle_human']} "
+            f"({swings['completed_cycles']} seen, {swings['threshold_pct']}% swings)"
+        )
+    dominant = (report.periodicity or {}).get("dominant") or []
+    if dominant:
+        best = dominant[0]
+        lines.append(f"  repeat ~{best['period_human']} [{best.get('confidence', 'n/a')}]")
+    if not swings.get("mean_cycle_human") and not dominant:
+        lines.append("  cycle  not enough history yet")
+
+    if report.phase:
+        lines.append(f"  phase  {report.phase['phase'].upper()}")
+    lines.append(
+        f"  data   {coverage['recorded_span_human']}, "
+        f"{coverage['gap_count']} gaps, {coverage['error_rate_pct']}% errors"
+    )
+    return "\n".join(lines)
+
+
 def render_csv(pair: str, bars: list[Bar]) -> str:
     lines = ["pair,bucket_start_utc,open,high,low,close,ticks,errors,spread_bps,imbalance"]
     for bar in bars:
@@ -708,7 +742,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="pick --bucket and --swing per pair from how much is recorded and how much it moves",
     )
-    parser.add_argument("--format", choices=("text", "json", "csv"), default="text", help="output format (default: text)")
+    parser.add_argument(
+        "--format",
+        choices=("text", "brief", "json", "csv"),
+        default="text",
+        help="output format: text, brief (phone sized), json, csv (default: text)",
+    )
     parser.add_argument("--list-pairs", action="store_true", help="list recorded pairs and exit")
     parser.add_argument(
         "--latest",
@@ -832,6 +871,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.format == "json":
             print(json.dumps({"window": window, "pairs": [asdict(report) for report in reports]}, indent=2))
+        elif args.format == "brief":
+            print(f"oakring  {window['length']} to {window['end']}")
+            for report in reports:
+                print("")
+                print(render_brief(report))
+            if empty:
+                print(f"\nnothing recorded yet: {', '.join(empty)}")
         else:
             print(f"oakring market cycle report  |  db {db_path}")
             for report in reports:
