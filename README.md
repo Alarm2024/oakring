@@ -72,6 +72,7 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 python3 analyze.py --latest                              # price right now, every pair
 python3 analyze.py --list-pairs                          # what has been recorded
 python3 analyze.py --auto                                # let it pick the settings
+python3 analyze.py --cross --since 12h                   # USDT vs USDC vs the peg
 python3 analyze.py --since 7d  --bucket 1h               # every pair, the default view
 python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
 python3 analyze.py --since 24h --bucket 15m --format json > report.json
@@ -81,6 +82,7 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--latest` | off | Current price per pair with 1h/24h/7d change, then exit |
+| `--cross` | off | USDT vs USDC books against the peg, over `--since`, then exit |
 | `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
 | `--since` | `7d` | Window back from now (`90m`, `24h`, `7d`, `2w`) |
 | `--bucket` | `1h` | Resample size; the bar is the unit every cycle length is quoted in |
@@ -205,6 +207,29 @@ SOLUSDT  107.5547
 ```
 
 `move` is measured over the data that exists, which the `data` line states outright along with gaps and errors — so a report built on a broken recording says so.
+
+## The USDT / USDC cross
+
+When the same asset is recorded against both quote currencies and `USDCUSDT` is recorded too, the three legs form a triangle:
+
+```bash
+python3 analyze.py --cross --since 12h
+```
+
+```
+BTC  2026-09-14T23:31:00Z
+  books    USDT 78,425.85 / USDC 78,421.80
+  implied  +0.52 bps   peg says +0.60 bps
+  residual -0.08 bps vs 0.05 bps of spread  -> outside cost
+  over 6.0h: mean +0.00, sd 0.22, widest -0.66 bps
+  beyond spread cost in 81.99% of 361 aligned ticks
+```
+
+`implied` is what the two books say USDC is worth (`mid_USDT / mid_USDC`); `peg says` is what `USDCUSDT` trades at; `residual` is the disagreement. The recorder stamps every pair in a tick with one timestamp, so all three legs come from the same instant — no interpolation and no stale leg.
+
+`cost` is half a spread on each of the three legs. **Exchange fees are not included** and are usually several bps, far wider than these residuals — so `outside cost` means the disagreement is measurable, not that it is profitable. The tool prints that caveat itself.
+
+The percentage is the useful number over time: a pair whose residual sits inside the spread all day is quoted coherently, while one that spends most of its time outside a very tight spread is mostly showing you measurement noise.
 
 ## Scheduled reports
 

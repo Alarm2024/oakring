@@ -603,6 +603,91 @@ class BriefFormatTests(TempConfigCase):
         self.assertLessEqual(widest, 44, "brief output must not wrap on a phone terminal")
 
 
+class CrossTests(TempConfigCase):
+    def seed_triangle(self, peg: float = 1.00006, slip: float = 0.0) -> None:
+        """Three legs stamped with one timestamp each tick, as the recorder writes them."""
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        now -= now % 60
+        rows = []
+        for index, epoch in enumerate(range(now - 3600, now + 60, 60)):
+            ts = common.to_ts_utc(common.from_epoch(epoch))
+
+            def add(pair: str, mid: float, spread_bps: float) -> None:
+                half = mid * spread_bps / 20000.0
+                rows.append((ts, epoch, pair, "binance", mid - half, mid + half,
+                             mid, spread_bps, 5.0, 5.0, None))
+
+            add("USDCUSDT", peg, 0.10)
+            usdt_mid = 78000.0 + index
+            add("BTCUSDT", usdt_mid, 0.01)
+            add("BTCUSDC", usdt_mid / peg * (1 + slip), 0.01)
+        recorder.insert_rows(conn, rows)
+        conn.close()
+
+    def test_a_coherent_triangle_leaves_no_residual(self) -> None:
+        self.seed_triangle()
+        conn = common.connect(self.db_path, read_only=True)
+        self.assertEqual(cross := analyze.cross_bases(conn), ["BTC"])
+        now = common.to_epoch(common.now_utc())
+        report = analyze.cross_report(conn, cross[0], now - 7200, now)
+        conn.close()
+
+        self.assertAlmostEqual(report["last"]["quoted_bps"], 0.6, places=1)
+        self.assertAlmostEqual(report["last"]["implied_bps"], 0.6, places=1)
+        self.assertAlmostEqual(report["last"]["residual_bps"], 0.0, places=2)
+        self.assertEqual(report["beyond_cost_ticks"], 0)
+
+    def test_a_dislocated_usdc_book_shows_up_as_residual(self) -> None:
+        self.seed_triangle(slip=0.0005)  # USDC book 5 bps rich against the peg
+        conn = common.connect(self.db_path, read_only=True)
+        now = common.to_epoch(common.now_utc())
+        report = analyze.cross_report(conn, "BTC", now - 7200, now)
+        conn.close()
+
+        self.assertLess(report["last"]["residual_bps"], -4.0)
+        self.assertGreater(report["last"]["cost_bps"], 0.0)
+        self.assertEqual(report["beyond_cost_pct"], 100.0)
+
+    def test_needs_all_three_legs(self) -> None:
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        recorder.insert_rows(
+            conn,
+            [(common.to_ts_utc(common.from_epoch(now)), now, "BTCUSDT", "binance",
+              1.0, 1.1, 1.05, 1.0, 1.0, 1.0, None)],
+        )
+        conn.close()
+        conn = common.connect(self.db_path, read_only=True)
+        self.assertEqual(analyze.cross_bases(conn), [], "no peg pair recorded")
+        conn.close()
+
+        buffer = io.StringIO()
+        stderr, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            with redirect_stdout(buffer):
+                self.assertEqual(analyze.main(["--db", str(self.db_path), "--cross"]), 1)
+            self.assertIn("USDCUSDT", sys.stderr.getvalue())
+        finally:
+            sys.stderr = stderr
+
+    def test_cli_states_the_fee_caveat(self) -> None:
+        self.seed_triangle()
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(analyze.main(["--db", str(self.db_path), "--cross", "--since", "2h"]), 0)
+        output = buffer.getvalue()
+        self.assertIn("BTC", output)
+        self.assertIn("residual", output)
+        self.assertIn("fees are", output)
+        self.assertIn("measurable, not profitable", output)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            analyze.main(["--db", str(self.db_path), "--cross", "--since", "2h", "--format", "json"])
+        self.assertEqual(json.loads(buffer.getvalue())["cross"][0]["base"], "BTC")
+
+
 class CliTests(TempConfigCase):
     def test_text_json_and_csv_output(self) -> None:
         seed_cycle_db(self.db_path)

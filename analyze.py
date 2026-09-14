@@ -201,6 +201,161 @@ def render_latest(snapshot: list[dict], stale_after: int) -> str:
     return "\n".join(lines)
 
 
+PEG_PAIR = "USDCUSDT"
+
+
+def cross_bases(conn, pairs: list[str] | None = None) -> list[str]:
+    """Assets recorded against both USDT and USDC, given the peg is recorded too."""
+    recorded = {row[0] for row in conn.execute("SELECT DISTINCT pair FROM ticks")}
+    if PEG_PAIR not in recorded:
+        return []
+    wanted = {pair.upper() for pair in pairs} if pairs else None
+    bases = []
+    for pair in sorted(recorded):
+        if not pair.endswith("USDT") or pair == PEG_PAIR:
+            continue
+        base = pair[: -len("USDT")]
+        if base + "USDC" not in recorded:
+            continue
+        if wanted and not ({pair, base + "USDC", base} & wanted):
+            continue
+        bases.append(base)
+    return bases
+
+
+def cross_series(conn, base: str, start: int, end: int) -> list[dict]:
+    """Per tick: what the two books imply about USDC, and what the peg actually says.
+
+    The recorder stamps every pair in a tick with one timestamp, so the three
+    legs line up exactly - no interpolation, no stale leg.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT {EPOCH_SQL} AS epoch,
+               MAX(CASE WHEN pair = ? THEN mid END) AS usdt,
+               MAX(CASE WHEN pair = ? THEN mid END) AS usdc,
+               MAX(CASE WHEN pair = ? THEN mid END) AS peg,
+               MAX(CASE WHEN pair = ? THEN spread_bps END) AS usdt_spread,
+               MAX(CASE WHEN pair = ? THEN spread_bps END) AS usdc_spread,
+               MAX(CASE WHEN pair = ? THEN spread_bps END) AS peg_spread
+        FROM ticks
+        WHERE pair IN (?, ?, ?) AND note IS NULL AND mid IS NOT NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        GROUP BY epoch
+        HAVING usdt IS NOT NULL AND usdc IS NOT NULL AND peg IS NOT NULL
+        ORDER BY epoch
+        """,
+        (
+            f"{base}USDT", f"{base}USDC", PEG_PAIR,
+            f"{base}USDT", f"{base}USDC", PEG_PAIR,
+            f"{base}USDT", f"{base}USDC", PEG_PAIR,
+            start, end,
+        ),
+    ).fetchall()
+
+    series = []
+    for row in rows:
+        usdt, usdc, peg = float(row["usdt"]), float(row["usdc"]), float(row["peg"])
+        if usdc <= 0 or peg <= 0:
+            continue
+        implied = (usdt / usdc - 1.0) * 10000.0
+        quoted = (peg - 1.0) * 10000.0
+        # Half a spread crossed on each of the three legs. Excludes fees.
+        cost = (
+            float(row["usdt_spread"] or 0.0)
+            + float(row["usdc_spread"] or 0.0)
+            + float(row["peg_spread"] or 0.0)
+        ) / 2.0
+        series.append(
+            {
+                "epoch": int(row["epoch"]),
+                "usdt": usdt,
+                "usdc": usdc,
+                "peg": peg,
+                "implied_bps": implied,
+                "quoted_bps": quoted,
+                "residual_bps": implied - quoted,
+                "cost_bps": cost,
+            }
+        )
+    return series
+
+
+def cross_report(conn, base: str, start: int, end: int) -> dict:
+    series = cross_series(conn, base, start, end)
+    if not series:
+        return {"base": base, "status": "no tick has all three legs priced yet"}
+
+    residuals = [point["residual_bps"] for point in series]
+    last = series[-1]
+    beyond = [point for point in series if abs(point["residual_bps"]) > point["cost_bps"]]
+    widest = max(series, key=lambda point: abs(point["residual_bps"]))
+    span = series[-1]["epoch"] - series[0]["epoch"]
+
+    return {
+        "base": base,
+        "ticks": len(series),
+        "span_human": common.format_duration(span),
+        "last": {
+            "at": common.to_ts_utc(common.from_epoch(last["epoch"])),
+            "usdt": last["usdt"],
+            "usdc": last["usdc"],
+            "implied_bps": round(last["implied_bps"], 3),
+            "quoted_bps": round(last["quoted_bps"], 3),
+            "residual_bps": round(last["residual_bps"], 3),
+            "cost_bps": round(last["cost_bps"], 3),
+        },
+        "residual_mean_bps": round(statistics.fmean(residuals), 3),
+        "residual_stdev_bps": round(statistics.stdev(residuals), 3) if len(residuals) > 1 else 0.0,
+        "residual_widest_bps": round(widest["residual_bps"], 3),
+        "residual_widest_at": common.to_ts_utc(common.from_epoch(widest["epoch"])),
+        "beyond_cost_ticks": len(beyond),
+        "beyond_cost_pct": round(100.0 * len(beyond) / len(series), 2),
+    }
+
+
+def render_cross(reports: list[dict]) -> str:
+    lines = []
+    for report in reports:
+        lines.append("")
+        if "status" in report:
+            lines.append(f"{report['base']}: {report['status']}")
+            continue
+        last = report["last"]
+        lines.append(f"{report['base']}  {last['at']}")
+        lines.append(
+            f"  books    USDT {price_fmt(last['usdt'])} / USDC {price_fmt(last['usdc'])}"
+        )
+        lines.append(
+            f"  implied  {last['implied_bps']:+.2f} bps   peg says {last['quoted_bps']:+.2f} bps"
+        )
+        lines.append(
+            f"  residual {last['residual_bps']:+.2f} bps vs {last['cost_bps']:.2f} bps of spread"
+            f"  -> {'outside' if abs(last['residual_bps']) > last['cost_bps'] else 'inside'} cost"
+        )
+        lines.append(
+            f"  over {report['span_human']}: mean {report['residual_mean_bps']:+.2f}, "
+            f"sd {report['residual_stdev_bps']:.2f}, "
+            f"widest {report['residual_widest_bps']:+.2f} bps"
+        )
+        lines.append(
+            f"  beyond spread cost in {report['beyond_cost_pct']}% of "
+            f"{report['ticks']} aligned ticks"
+        )
+    if any("status" not in report for report in reports):
+        lines.append("")
+        lines.append(
+            "Spread cost is half a spread on each of the three legs. Exchange fees are"
+        )
+        lines.append(
+            "NOT included and are usually several bps - far wider than these residuals,"
+        )
+        lines.append(
+            "so 'outside cost' here means measurable, not profitable."
+        )
+    return "\n".join(lines)
+
+
 def load_bars(conn, pair: str, start: int, end: int, bucket: int) -> list[Bar]:
     """Fold ticks into OHLC buckets. Error rows count but never move the price."""
     cursor = conn.execute(
@@ -750,6 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--list-pairs", action="store_true", help="list recorded pairs and exit")
     parser.add_argument(
+        "--cross",
+        action="store_true",
+        help=f"compare each asset's USDT and USDC books against {PEG_PAIR}, and exit",
+    )
+    parser.add_argument(
         "--latest",
         action="store_true",
         help="show the current price per pair with 1h/24h/7d change, and exit",
@@ -783,6 +943,30 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'pair':<12} {'ticks':>8}  first                 last")
             for pair, count, first_ts, last_ts in rows:
                 print(f"{pair:<12} {count:>8}  {first_ts}  {last_ts}")
+            return 0
+
+        if args.cross:
+            try:
+                since_sec = common.parse_duration(args.since)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            end_epoch = common.to_epoch(common.now_utc())
+            bases = cross_bases(conn, args.pairs)
+            if not bases:
+                print(
+                    f"--cross needs {PEG_PAIR} plus an asset recorded against both USDT and USDC "
+                    f"(e.g. BTCUSDT and BTCUSDC)",
+                    file=sys.stderr,
+                )
+                return 1
+            reports = [cross_report(conn, base, end_epoch - since_sec, end_epoch) for base in bases]
+            if args.format == "json":
+                print(json.dumps({"cross": reports}, indent=2))
+            else:
+                print(f"oakring cross  |  {PEG_PAIR} vs the USDT/USDC books")
+                print(render_cross(reports))
+                print("")
             return 0
 
         if args.latest:
