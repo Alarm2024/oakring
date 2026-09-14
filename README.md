@@ -69,6 +69,7 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 `analyze.py` opens the database read-only, so it is safe to run while the recorder is writing.
 
 ```bash
+python3 analyze.py --latest                              # price right now, every pair
 python3 analyze.py --list-pairs                          # what has been recorded
 python3 analyze.py --since 7d  --bucket 1h               # every pair, the default view
 python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
@@ -78,12 +79,28 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--latest` | off | Current price per pair with 1h/24h/7d change, then exit |
+| `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
 | `--since` | `7d` | Window back from now (`90m`, `24h`, `7d`, `2w`) |
 | `--bucket` | `1h` | Resample size; the bar is the unit every cycle length is quoted in |
 | `--swing` | `2.0` | Percent reversal that confirms a zigzag pivot |
 | `--pair` | all recorded | Repeatable |
 | `--format` | `text` | `text`, `json` (full report), `csv` (the OHLC bars) |
 | `--db` | `DB_PATH` | Override the database |
+
+### Current prices
+
+Cycle analysis needs history; `--latest` needs none, so it works the moment a pair starts recording:
+
+```
+$ python3 analyze.py --latest
+pair                price     spread      age        1h       24h        7d
+BTCUSDT         78,482.92    0.02bps      45s    -0.02%         -         -
+ETHUSDT          2,533.45    0.02bps      45s    -0.02%         -         -
+SOLUSDT          100.4032    1.00bps      45s    +0.66%    +0.03%    +0.20%
+```
+
+A `-` means that pair has not been recording long enough for that horizon yet, not that nothing moved. `age` is how long ago the last priced tick landed — anything over `--stale-after` is marked, which is the quickest way to notice the recorder has stopped.
 
 ### Reading the report
 

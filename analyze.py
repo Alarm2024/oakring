@@ -84,6 +84,84 @@ def list_pairs(conn) -> list[tuple[str, int, str, str]]:
     return [(r["pair"], r["n"], r["first_ts"], r["last_ts"]) for r in rows]
 
 
+EPOCH_SQL = "COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER))"
+
+
+def _change_since(conn, pair: str, last_epoch: int, last_mid: float, window: int) -> float | None:
+    """Percent change against the last priced tick at or before `window` ago."""
+    target = last_epoch - window
+    row = conn.execute(
+        f"""
+        SELECT mid, {EPOCH_SQL} AS epoch
+        FROM ticks
+        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL AND {EPOCH_SQL} <= ?
+        ORDER BY epoch DESC LIMIT 1
+        """,
+        (pair, target),
+    ).fetchone()
+    if row is None or not row["mid"]:
+        return None
+    # A reference point far older than asked for would misreport the change.
+    if target - int(row["epoch"]) > window * 0.5:
+        return None
+    return round(100.0 * (last_mid / float(row["mid"]) - 1.0), 3)
+
+
+def latest_snapshot(conn, pairs: list[str]) -> list[dict]:
+    """Most recent priced tick per pair, with short-horizon changes."""
+    now = common.to_epoch(common.now_utc())
+    snapshot: list[dict] = []
+    for pair in pairs:
+        row = conn.execute(
+            f"""
+            SELECT ts_utc, {EPOCH_SQL} AS epoch, bid, ask, mid, spread_bps
+            FROM ticks
+            WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+            ORDER BY epoch DESC LIMIT 1
+            """,
+            (pair,),
+        ).fetchone()
+        if row is None:
+            snapshot.append({"pair": pair, "status": "no priced ticks recorded yet"})
+            continue
+
+        last_epoch, last_mid = int(row["epoch"]), float(row["mid"])
+        age = max(0, now - last_epoch)
+        entry = {
+            "pair": pair,
+            "at": row["ts_utc"],
+            "age_sec": age,
+            "age_human": common.format_duration(age),
+            "bid": row["bid"],
+            "ask": row["ask"],
+            "mid": last_mid,
+            "spread_bps": row["spread_bps"],
+        }
+        for label, window in (("1h", 3600), ("24h", 86400), ("7d", 604800)):
+            entry[f"change_{label}_pct"] = _change_since(conn, pair, last_epoch, last_mid, window)
+        snapshot.append(entry)
+    return snapshot
+
+
+def render_latest(snapshot: list[dict], stale_after: int) -> str:
+    lines = [f"{'pair':<10} {'price':>14} {'spread':>10} {'age':>8} {'1h':>9} {'24h':>9} {'7d':>9}"]
+    for entry in snapshot:
+        if "status" in entry:
+            lines.append(f"{entry['pair']:<10} {entry['status']}")
+            continue
+        changes = []
+        for label in ("1h", "24h", "7d"):
+            value = entry[f"change_{label}_pct"]
+            changes.append("-" if value is None else f"{value:+.2f}%")
+        stale = "  (stale - is the recorder running?)" if entry["age_sec"] > stale_after else ""
+        lines.append(
+            f"{entry['pair']:<10} {price_fmt(entry['mid']):>14} "
+            f"{entry['spread_bps']:>7.2f}bps {entry['age_human']:>8} "
+            f"{changes[0]:>9} {changes[1]:>9} {changes[2]:>9}{stale}"
+        )
+    return "\n".join(lines)
+
+
 def load_bars(conn, pair: str, start: int, end: int, bucket: int) -> list[Bar]:
     """Fold ticks into OHLC buckets. Error rows count but never move the price."""
     cursor = conn.execute(
@@ -566,6 +644,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--swing", type=float, default=2.0, help="zigzag reversal threshold in percent (default: 2.0)")
     parser.add_argument("--format", choices=("text", "json", "csv"), default="text", help="output format (default: text)")
     parser.add_argument("--list-pairs", action="store_true", help="list recorded pairs and exit")
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="show the current price per pair with 1h/24h/7d change, and exit",
+    )
+    parser.add_argument(
+        "--stale-after",
+        default="5m",
+        help="flag a pair whose last tick is older than this in --latest (default: 5m)",
+    )
     return parser
 
 
@@ -590,6 +678,23 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'pair':<12} {'ticks':>8}  first                 last")
             for pair, count, first_ts, last_ts in rows:
                 print(f"{pair:<12} {count:>8}  {first_ts}  {last_ts}")
+            return 0
+
+        if args.latest:
+            pairs = args.pairs or [row[0] for row in list_pairs(conn)]
+            if not pairs:
+                print("no ticks recorded yet", file=sys.stderr)
+                return 1
+            try:
+                stale_after = common.parse_duration(args.stale_after)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            snapshot = latest_snapshot(conn, [pair.upper() for pair in pairs])
+            if args.format == "json":
+                print(json.dumps({"latest": snapshot}, indent=2))
+            else:
+                print(render_latest(snapshot, stale_after))
             return 0
 
         try:

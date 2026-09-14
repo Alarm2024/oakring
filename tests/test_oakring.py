@@ -430,6 +430,88 @@ class AnalysisTests(TempConfigCase):
         self.assertIn("SOLUSDT", text)
 
 
+class LatestSnapshotTests(TempConfigCase):
+    def seed(self) -> int:
+        """SOLUSDT with a day of history, BTCUSDT only minutes old - the state a
+        freshly added pair is actually in."""
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        last = now - 60  # the most recent tick; lookbacks are measured from it
+        rows = []
+        for epoch, mid in ((last - 86400, 100.0), (last - 3600, 101.0), (last, 102.0)):
+            rows.append(
+                (common.to_ts_utc(common.from_epoch(epoch)), epoch, "SOLUSDT",
+                 "binance", mid - 0.01, mid + 0.01, mid, 1.94, 1.0, 1.0, None)
+            )
+        rows.append(
+            (common.to_ts_utc(common.from_epoch(now - 30)), now - 30, "BTCUSDT",
+             "binance", 78000.0, 78001.0, 78000.5, 0.13, 1.0, 1.0, None)
+        )
+        # An error row after the last good tick must not become "the price".
+        rows.append(
+            (common.to_ts_utc(common.from_epoch(now - 10)), now - 10, "SOLUSDT",
+             "binance", None, None, None, None, None, None, "error:URLError")
+        )
+        recorder.insert_rows(conn, rows)
+        conn.close()
+        return now
+
+    def test_snapshot_prices_changes_and_missing_history(self) -> None:
+        self.seed()
+        conn = common.connect(self.db_path, read_only=True)
+        snapshot = {entry["pair"]: entry for entry in analyze.latest_snapshot(conn, ["SOLUSDT", "BTCUSDT"])}
+        conn.close()
+
+        sol = snapshot["SOLUSDT"]
+        self.assertEqual(sol["mid"], 102.0, "an error row must not shadow the last priced tick")
+        self.assertAlmostEqual(sol["change_1h_pct"], 0.99, places=1)   # 101 -> 102
+        self.assertAlmostEqual(sol["change_24h_pct"], 2.0, places=1)   # 100 -> 102
+        self.assertIsNone(sol["change_7d_pct"], "no week of history yet")
+
+        btc = snapshot["BTCUSDT"]
+        self.assertEqual(btc["mid"], 78000.5)
+        self.assertIsNone(btc["change_1h_pct"], "a half-hour-old pair cannot report a 1h change")
+        self.assertLess(btc["age_sec"], 120)
+
+    def test_pair_with_no_priced_ticks(self) -> None:
+        conn = common.connect(self.db_path)
+        recorder.insert_rows(
+            conn,
+            [("t", common.to_epoch(common.now_utc()), "NEWUSDT", "binance",
+              None, None, None, None, None, None, "error:URLError")],
+        )
+        conn.close()
+        conn = common.connect(self.db_path, read_only=True)
+        entry = analyze.latest_snapshot(conn, ["NEWUSDT"])[0]
+        conn.close()
+        self.assertIn("no priced ticks", entry["status"])
+
+    def test_stale_marker_and_cli(self) -> None:
+        self.seed()
+        rendered = analyze.render_latest(
+            [{"pair": "SOLUSDT", "mid": 102.0, "spread_bps": 1.94, "age_sec": 900,
+              "age_human": "15.0m", "change_1h_pct": 1.0, "change_24h_pct": None,
+              "change_7d_pct": None}],
+            stale_after=300,
+        )
+        self.assertIn("stale", rendered)
+        self.assertIn("+1.00%", rendered)
+        self.assertIn("-", rendered)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(analyze.main(["--db", str(self.db_path), "--latest"]), 0)
+        output = buffer.getvalue()
+        self.assertIn("SOLUSDT", output)
+        self.assertIn("BTCUSDT", output)
+        self.assertNotIn("stale", output)
+
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            self.assertEqual(analyze.main(["--db", str(self.db_path), "--latest", "--format", "json"]), 0)
+        self.assertEqual(len(json.loads(buffer.getvalue())["latest"]), 2)
+
+
 class CliTests(TempConfigCase):
     def test_text_json_and_csv_output(self) -> None:
         seed_cycle_db(self.db_path)
