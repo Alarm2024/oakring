@@ -120,6 +120,52 @@ The bucket sets the shortest cycle you can see (about 4 bars) and the window set
 | Daily swing | `7d` | `1h` | `2` |
 | Multi-week | `60d` | `4h` | `5` |
 
+## Scheduled reports
+
+`report.sh` writes a timestamped report into `~/.config/oakring/reports/` and prints the path. Any argument is passed through to `analyze.py`:
+
+```bash
+./report.sh                                   # the default week view
+./report.sh --since 30d --bucket 4h --swing 5 # the month view
+./report.sh --since 30d --format json         # machine-readable
+```
+
+A failed run leaves no half-written file behind.
+
+To have it run itself, install the timer (once the recorder is running and approved):
+
+```bash
+sudo cp /home/ubuntu/oakring/oakring-report.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now oakring-report.timer
+systemctl list-timers oakring-report.timer     # when it next fires
+```
+
+Weekly on Monday 00:05 UTC. For a monthly report instead, change `OnCalendar` in the timer to `*-*-01 00:05:00`. `Persistent=true` means a report missed while the droplet was down runs at the next boot. Run one immediately with `sudo systemctl start oakring-report.service`, and read the last outcome with `journalctl -u oakring-report`.
+
+## Downloading the recording
+
+The database runs in WAL mode, so copying `ring.db` with `scp` while the recorder is writing can capture a torn file. Take a consistent snapshot first — this is safe on a live database:
+
+```bash
+sqlite3 ~/.config/oakring/ring.db ".backup /tmp/ring-snapshot.db"
+```
+
+Then, from the machine you want it on:
+
+```bash
+scp ubuntu@DROPLET:/tmp/ring-snapshot.db .
+python3 analyze.py --db ring-snapshot.db --since 30d --bucket 4h
+```
+
+The analyzer only needs the file, so the same commands work anywhere with Python 3.9+. To pull the generated reports instead of the raw data:
+
+```bash
+scp -r ubuntu@DROPLET:/home/ubuntu/.config/oakring/reports .
+```
+
+A month of three pairs at 60s is roughly 130k rows — a few tens of MB, and it compresses well with `gzip` if the link is slow.
+
 ## SQLite queries
 
 ```bash
@@ -191,9 +237,11 @@ python3 -m unittest discover -s tests -v
 | File | Purpose |
 |------|---------|
 | `recorder.py` | Poll loop: batched fetch, retries, error rows, pruning, clean shutdown |
+| `report.sh` | Writes a timestamped report; what the timer runs |
 | `analyze.py` | Cycle report: bars, coverage, trend, swings, periodogram, phase |
 | `common.py` | Shared config, database open/migrate, time helpers |
 | `schema.sql` | `ticks` table and indexes |
 | `tests/test_oakring.py` | Offline test suite |
 | `.env.example` | Sample configuration (copy to `~/.config/oakring/.env`) |
 | `oakring.service` | Hardened systemd unit template |
+| `oakring-report.{service,timer}` | Scheduled weekly report |

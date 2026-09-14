@@ -24,10 +24,19 @@ import common
 
 USER_AGENT = "oakring/2.0"
 _shutdown = threading.Event()
+_shutdown_signal: int | None = None
 
 
 def _handle_signal(signum: int, _frame: object) -> None:
-    logging.info("received %s, shutting down after this tick", signal.Signals(signum).name)
+    """Must stay async-signal-safe.
+
+    A signal can land while the main thread is inside a stdout write or holds
+    the logging lock, so logging from here raises "reentrant call inside
+    BufferedWriter" at best and deadlocks at worst. Record it and let the main
+    loop do the talking.
+    """
+    global _shutdown_signal
+    _shutdown_signal = signum
     _shutdown.set()
 
 
@@ -200,6 +209,8 @@ def main() -> None:
             _shutdown.wait(delay)
     finally:
         conn.close()
+        if _shutdown_signal is not None:
+            logging.info("received %s", signal.Signals(_shutdown_signal).name)
         logging.info("recorder stopped")
 
 

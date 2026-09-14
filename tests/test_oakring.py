@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import math
 import os
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -149,6 +151,36 @@ class RowBuildingTests(unittest.TestCase):
     def test_tick_alignment_never_drifts(self) -> None:
         self.assertEqual(recorder.next_tick_at(1767225601.4, 60), 1767225660)
         self.assertEqual(recorder.next_tick_at(1767225660.0, 60), 1767225720)
+
+
+class SignalHandlerTests(unittest.TestCase):
+    def test_handler_sets_the_event_without_logging(self) -> None:
+        """Logging from a signal handler raises a reentrant BufferedWriter call
+        (or deadlocks on the logging lock) when the signal lands mid-write."""
+        records: list[logging.LogRecord] = []
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        capture = Capture()
+        root = logging.getLogger()
+        previous_level = root.level
+        root.addHandler(capture)
+        root.setLevel(logging.DEBUG)  # otherwise a silent root makes this vacuous
+        try:
+            recorder._shutdown.clear()
+            recorder._shutdown_signal = None
+            recorder._handle_signal(signal.SIGTERM, None)
+
+            self.assertTrue(recorder._shutdown.is_set())
+            self.assertEqual(recorder._shutdown_signal, signal.SIGTERM)
+            self.assertEqual([record.getMessage() for record in records], [])
+        finally:
+            root.removeHandler(capture)
+            root.setLevel(previous_level)
+            recorder._shutdown.clear()
+            recorder._shutdown_signal = None
 
 
 class RecorderLoopTests(TempConfigCase):
