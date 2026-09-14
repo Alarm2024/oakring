@@ -11,7 +11,7 @@ Record for a while first. A cycle you cannot see three of is not a cycle you hav
 
 ## Requirements
 
-- Python 3.11+ (stdlib only, no packages to install)
+- Python 3.9+ (stdlib only, no packages to install; developed and tested on 3.11)
 - Outbound HTTPS to Binance (no listen sockets, no wallets, no API keys — `bookTicker` is a public endpoint)
 
 ## Install
