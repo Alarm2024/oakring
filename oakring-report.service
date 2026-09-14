@@ -1,0 +1,24 @@
+[Unit]
+Description=Oakring market cycle report
+Documentation=https://github.com/Alarm2024/oakring
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/oakring
+ExecStart=/home/ubuntu/oakring/report.sh --since 7d --bucket 1h
+
+# Reads the database, writes only into the reports directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.config/oakring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateNetwork=true
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

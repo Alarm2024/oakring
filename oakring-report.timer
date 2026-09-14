@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly oakring market cycle report
+
+[Timer]
+# Mondays at 00:05 UTC. For a monthly report instead: OnCalendar=*-*-01 00:05:00
+OnCalendar=Mon *-*-* 00:05:00
+# Run on the next boot if the droplet was down when it was due.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
