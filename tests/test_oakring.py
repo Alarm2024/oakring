@@ -512,6 +512,67 @@ class LatestSnapshotTests(TempConfigCase):
         self.assertEqual(len(json.loads(buffer.getvalue())["latest"]), 2)
 
 
+class AutoSettingsTests(TempConfigCase):
+    def test_bucket_scales_with_how_much_was_recorded(self) -> None:
+        self.assertEqual(analyze.choose_bucket(47 * 3600), 900)      # two days -> 15m
+        self.assertEqual(analyze.choose_bucket(7 * 86400), 3600)     # a week   -> 1h
+        self.assertEqual(analyze.choose_bucket(30 * 86400), 14400)   # a month  -> 4h
+        self.assertEqual(analyze.choose_bucket(600), 60)             # ten minutes clamps to the floor
+        self.assertEqual(analyze.choose_bucket(5 * 365 * 86400), 86400)  # and to the ceiling
+
+    def test_swing_scales_with_volatility(self) -> None:
+        quiet = [analyze.Bar(i * 900, 0, 0, 0, 100.0 * (1 + 0.0005 * ((-1) ** i)), 1, 0, None, None) for i in range(60)]
+        wild = [analyze.Bar(i * 900, 0, 0, 0, 100.0 * (1 + 0.02 * ((-1) ** i)), 1, 0, None, None) for i in range(60)]
+        self.assertLess(analyze.choose_swing(quiet), analyze.choose_swing(wild))
+        self.assertGreaterEqual(analyze.choose_swing(quiet), 0.1)
+        self.assertLessEqual(analyze.choose_swing(wild), 10.0)
+        self.assertEqual(analyze.choose_swing([]), 0.5, "no data falls back rather than dividing by zero")
+
+    def test_suggestion_names_a_bucket_that_fits(self) -> None:
+        # Two days of data asked for in 4h buckets: the note should point at 15m.
+        bars = [analyze.Bar(i * 14400, 0, 0, 0, 100.0 + i, 1, 0, None, None) for i in range(12)]
+        suggestion = analyze._bucket_suggestion(bars, 14400)
+        self.assertIn("--bucket 15.0m", suggestion)
+        self.assertIn("--auto", suggestion)
+        self.assertEqual(analyze._bucket_suggestion(bars, 900), "", "no advice when the bucket already fits")
+
+    def test_auto_rescues_a_window_far_wider_than_the_recording(self) -> None:
+        """The exact situation on the host: 30d asked for, ~2 days recorded."""
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        now -= now % 60
+        rows = []
+        for index, epoch in enumerate(range(now - 47 * 3600, now + 60, 60)):
+            mid = 100.0 * (1 + 0.03 * math.sin(2 * math.pi * index / (9 * 60)))
+            rows.append(
+                (common.to_ts_utc(common.from_epoch(epoch)), epoch, "SOLUSDT", "binance",
+                 mid * 0.9999, mid * 1.0001, mid, 0.97, 5.0, 5.0, None)
+            )
+        recorder.insert_rows(conn, rows)
+        conn.close()
+
+        conn = common.connect(self.db_path, read_only=True)
+        self.assertAlmostEqual(analyze.recorded_span(conn, "SOLUSDT", now - 30 * 86400, now) / 3600, 47, delta=1)
+        conn.close()
+
+        fixed = io.StringIO()
+        with redirect_stdout(fixed):
+            analyze.main(["--db", str(self.db_path), "--since", "30d", "--bucket", "4h", "--swing", "5"])
+        self.assertIn("below the 20 needed", fixed.getvalue())
+        self.assertIn("--auto", fixed.getvalue(), "a useless report must say what to use instead")
+
+        auto = io.StringIO()
+        with redirect_stdout(auto):
+            self.assertEqual(analyze.main(["--db", str(self.db_path), "--since", "30d", "--auto"]), 0)
+        output = auto.getvalue()
+        self.assertIn("bucket 15.0m", output)
+        self.assertNotIn("below the 20 needed", output)
+        self.assertIn("periodicity", output)
+        # The planted 9h cycle should come back out of both detectors.
+        self.assertRegex(output, r"cycle length mean 9\.\dh")
+        self.assertRegex(output, r"~9\.\dh")
+
+
 class CliTests(TempConfigCase):
     def test_text_json_and_csv_output(self) -> None:
         seed_cycle_db(self.db_path)

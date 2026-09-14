@@ -29,6 +29,11 @@ from pathlib import Path
 import common
 
 MIN_BARS_FOR_STATS = 5
+TARGET_BARS = 150  # what --auto aims for: enough to see a cycle, few enough to stay readable
+BUCKET_LADDER = (60, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400)
+
+# Legacy rows written before ts_epoch existed still carry a usable ts_utc.
+EPOCH_SQL = "COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER))"
 MIN_BARS_FOR_CYCLES = 20
 PERIOD_CANDIDATES = 240  # log-spaced, keeps the periodogram O(candidates * bars)
 
@@ -84,7 +89,41 @@ def list_pairs(conn) -> list[tuple[str, int, str, str]]:
     return [(r["pair"], r["n"], r["first_ts"], r["last_ts"]) for r in rows]
 
 
-EPOCH_SQL = "COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER))"
+def choose_bucket(span_sec: int) -> int:
+    """A round bucket that turns `span_sec` of recording into ~TARGET_BARS bars."""
+    target = max(60, span_sec / TARGET_BARS)
+    return min(BUCKET_LADDER, key=lambda value: abs(math.log(value / target)))
+
+
+def choose_swing(bars: list[Bar]) -> float:
+    """A zigzag threshold scaled to how much this pair actually moves per bar.
+
+    A fixed percentage is wrong in both directions: 5% never triggers on a
+    two-day BTC window, and 0.5% turns SOL noise into dozens of fake pivots.
+    """
+    closes = [bar.close for bar in bars]
+    if len(closes) < 3:
+        return 0.5
+    moves = [abs(math.log(closes[i] / closes[i - 1])) for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if not moves:
+        return 0.5
+    return round(min(10.0, max(0.1, 3.0 * statistics.fmean(moves) * 100.0)), 2)
+
+
+def recorded_span(conn, pair: str, start: int, end: int) -> int:
+    """Seconds between the first and last priced tick for this pair in the window."""
+    row = conn.execute(
+        f"""
+        SELECT MIN({EPOCH_SQL}) AS first_epoch, MAX({EPOCH_SQL}) AS last_epoch
+        FROM ticks
+        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        """,
+        (pair, start, end),
+    ).fetchone()
+    if row is None or row["first_epoch"] is None:
+        return 0
+    return max(0, int(row["last_epoch"]) - int(row["first_epoch"]))
 
 
 def _change_since(conn, pair: str, last_epoch: int, last_mid: float, window: int) -> float | None:
@@ -370,6 +409,20 @@ def classify_phase(
 # --------------------------------------------------------------------------- report
 
 
+def _bucket_suggestion(bars: list[Bar], bucket: int) -> str:
+    """Name a bucket that would fit the data actually present, if it differs."""
+    if len(bars) < 2:
+        return " - record for longer, or use --auto"
+    span = bars[-1].start - bars[0].start + bucket
+    better = choose_bucket(span)
+    if better == bucket:
+        return ""
+    return (
+        f" - {common.format_duration(span)} recorded, so try "
+        f"--bucket {common.format_duration(better)} (or --auto)"
+    )
+
+
 def analyse_pair(bars: list[Bar], pair: str, bucket: int, swing_pct: float, window: dict) -> PairReport:
     report = PairReport(pair=pair, bucket_sec=bucket, window=window)
     closes = [bar.close for bar in bars]
@@ -424,8 +477,9 @@ def analyse_pair(bars: list[Bar], pair: str, bucket: int, swing_pct: float, wind
     if imbalances:
         report.price["avg_book_imbalance"] = round(statistics.fmean(imbalances), 4)
 
+    suggestion = _bucket_suggestion(bars, bucket)
     if len(bars) < MIN_BARS_FOR_STATS:
-        report.notes.append(f"only {len(bars)} bars - too few for trend or cycle statistics")
+        report.notes.append(f"only {len(bars)} bars - too few for trend or cycle statistics{suggestion}")
         return report
 
     logs = [math.log(close) for close in closes]
@@ -489,14 +543,16 @@ def analyse_pair(bars: list[Bar], pair: str, bucket: int, swing_pct: float, wind
             "move_pct": round(100.0 * (last / last_pivot.price - 1.0), 3) if last_pivot.price > 0 else None,
         }
     else:
+        suggested_swing = choose_swing(bars)
         report.notes.append(
-            f"no {swing_pct}% swing found - lower --swing or record a longer window to see cycles"
+            f"no {swing_pct}% swing found - this pair moves about {suggested_swing}% per swing here, "
+            f"try --swing {suggested_swing} (or --auto)"
         )
 
     report.periodicity = {"dominant": periodogram(logs, bucket)}
     if len(bars) < MIN_BARS_FOR_CYCLES:
         report.notes.append(
-            f"{len(bars)} bars is below the {MIN_BARS_FOR_CYCLES} needed for periodicity - widen --since or shrink --bucket"
+            f"{len(bars)} bars is below the {MIN_BARS_FOR_CYCLES} needed for periodicity{suggestion}"
         )
     else:
         for entry in report.periodicity["dominant"]:
@@ -529,6 +585,7 @@ def render_text(report: PairReport) -> str:
     lines.append(f"=== {report.pair} ===")
     lines.append(
         f"window {report.window['start']} -> {report.window['end']}  bucket {bucket}"
+        f"  swing {report.swings.get('threshold_pct', '-')}%"
     )
 
     coverage = report.coverage
@@ -642,6 +699,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--since", default="7d", help="window length back from now, e.g. 90m, 24h, 7d (default: 7d)")
     parser.add_argument("--bucket", default="1h", help="resample bucket, e.g. 5m, 1h, 4h (default: 1h)")
     parser.add_argument("--swing", type=float, default=2.0, help="zigzag reversal threshold in percent (default: 2.0)")
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="pick --bucket and --swing per pair from how much is recorded and how much it moves",
+    )
     parser.add_argument("--format", choices=("text", "json", "csv"), default="text", help="output format (default: text)")
     parser.add_argument("--list-pairs", action="store_true", help="list recorded pairs and exit")
     parser.add_argument(
@@ -706,7 +768,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.swing < 0:
             print("--swing must be >= 0", file=sys.stderr)
             return 2
-        if bucket > since_sec:
+        if bucket > since_sec and not args.auto:
             print(f"--bucket ({args.bucket}) is larger than --since ({args.since})", file=sys.stderr)
             return 2
 
@@ -731,14 +793,24 @@ def main(argv: list[str] | None = None) -> int:
 
         for pair in pairs:
             pair = pair.upper()
-            bars = load_bars(conn, pair, start_epoch, end_epoch, bucket)
+            pair_bucket, pair_swing = bucket, args.swing
+
+            if args.auto:
+                span = recorded_span(conn, pair, start_epoch, end_epoch)
+                if span:
+                    pair_bucket = choose_bucket(span)
+
+            bars = load_bars(conn, pair, start_epoch, end_epoch, pair_bucket)
             if not bars:
                 empty.append(pair)
                 continue
+            if args.auto:
+                pair_swing = choose_swing(bars)
+
             if args.format == "csv":
                 csv_chunks.append(render_csv(pair, bars))
             else:
-                reports.append(analyse_pair(bars, pair, bucket, args.swing, window))
+                reports.append(analyse_pair(bars, pair, pair_bucket, pair_swing, window))
 
         if args.format == "csv":
             if not csv_chunks:

@@ -71,6 +71,7 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 ```bash
 python3 analyze.py --latest                              # price right now, every pair
 python3 analyze.py --list-pairs                          # what has been recorded
+python3 analyze.py --auto                                # let it pick the settings
 python3 analyze.py --since 7d  --bucket 1h               # every pair, the default view
 python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
 python3 analyze.py --since 24h --bucket 15m --format json > report.json
@@ -84,6 +85,7 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 | `--since` | `7d` | Window back from now (`90m`, `24h`, `7d`, `2w`) |
 | `--bucket` | `1h` | Resample size; the bar is the unit every cycle length is quoted in |
 | `--swing` | `2.0` | Percent reversal that confirms a zigzag pivot |
+| `--auto` | off | Pick `--bucket` and `--swing` per pair from the data present |
 | `--pair` | all recorded | Repeatable |
 | `--format` | `text` | `text`, `json` (full report), `csv` (the OHLC bars) |
 | `--db` | `DB_PATH` | Override the database |
@@ -126,6 +128,24 @@ phase      DISTRIBUTION - 68% up the window range, recent -0.47%/day vs +/-1.10%
 - **swings** — zigzag pivots: a peak or trough is only confirmed once price reverses by `--swing`. Cycle length is measured peak-to-peak and trough-to-trough, so a "2.0d cycle" means roughly two days from one top to the next. A pivot on the first bar is discarded, since a window starting mid-swing did not witness that turn.
 - **periodicity** — a periodogram over detrended log price. It reports the strongest repeating periods independently of the swing threshold, which is the useful cross-check: when the zigzag and the periodogram agree on a length, the cycle is probably real. `cycles_in_window` below 3 is marked low confidence — that is too little history to claim a period.
 - **phase** — a Wyckoff-style four-phase read (accumulation, markup, distribution, markdown, or ranging) from where price sits in the range and whether the recent leg is moving faster than half a daily sigma. It is a heuristic summary of the recording, not a signal, and it says nothing about what happens next.
+
+### Letting it pick: `--auto`
+
+The settings that matter depend on how much has been recorded and how much the pair moves, and getting them wrong produces a report that says nothing — 4-hour buckets over two days give 13 bars, and a 5% swing threshold never triggers on a pair whose whole range is 2.9%.
+
+`--auto` derives both per pair: a bucket that turns the recording into roughly 150 bars, and a swing threshold scaled to that pair's own per-bar movement. Each pair gets its own, which is the point — BTC and SOL do not swing by the same percentage.
+
+```bash
+python3 analyze.py --since 30d --auto
+```
+
+The header line reports what it chose, so you can pin those values by hand afterwards:
+
+```
+window 2026-08-15T23:13:10Z -> 2026-09-14T23:13:10Z  bucket 15.0m  swing 1.14%
+```
+
+Without `--auto`, a report with too few bars now names the bucket that would have fitted instead of just complaining.
 
 ### Picking a window and bucket
 
