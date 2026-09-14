@@ -512,6 +512,18 @@ class LatestSnapshotTests(TempConfigCase):
         self.assertEqual(len(json.loads(buffer.getvalue())["latest"]), 2)
 
 
+class PriceFormatTests(unittest.TestCase):
+    def test_precision_follows_magnitude(self) -> None:
+        self.assertEqual(analyze.price_fmt(78572.34), "78,572.34")
+        self.assertEqual(analyze.price_fmt(102.875), "102.8750")
+        self.assertEqual(analyze.price_fmt(0.99985), "0.99985000")
+
+    def test_stablecoin_peg_deviation_stays_visible(self) -> None:
+        # A 1.5 bps premium on USDC must not round to a flat 1.0000.
+        self.assertEqual(analyze.price_fmt(1.00015), "1.000150")
+        self.assertNotEqual(analyze.price_fmt(1.00015), analyze.price_fmt(1.00005))
+
+
 class AutoSettingsTests(TempConfigCase):
     def test_bucket_scales_with_how_much_was_recorded(self) -> None:
         self.assertEqual(analyze.choose_bucket(47 * 3600), 900)      # two days -> 15m

@@ -573,8 +573,12 @@ def analyse_pair(bars: list[Bar], pair: str, bucket: int, swing_pct: float, wind
 def price_fmt(value: float) -> str:
     if value >= 1000:
         return f"{value:,.2f}"
-    if value >= 1:
+    if value >= 10:
         return f"{value:.4f}"
+    if value >= 1:
+        # A stablecoin sits just above 1.0 and its peg moves in the 5th and 6th
+        # digits; four decimals would round every deviation away.
+        return f"{value:.6f}"
     return f"{value:.8f}"
 
 

@@ -147,6 +147,21 @@ window 2026-08-15T23:13:10Z -> 2026-09-14T23:13:10Z  bucket 15.0m  swing 1.14%
 
 Without `--auto`, a report with too few bars now names the bucket that would have fitted instead of just complaining.
 
+### Stablecoins and the peg
+
+`USDCUSDT` and friends sit at roughly 1.0, so percentage change and cycle phase say little. What matters is the deviation from the peg and the spread, both of which the recorder already stores. Prices between 1 and 10 print to six decimals so a deviation of a basis point or two stays visible rather than rounding to a flat `1.0000`.
+
+```sql
+-- peg deviation in basis points, worst first
+SELECT ts_utc, mid, ROUND((mid - 1.0) * 10000, 2) AS deviation_bps, spread_bps
+FROM ticks
+WHERE pair = 'USDCUSDT' AND note IS NULL
+ORDER BY ABS(mid - 1.0) DESC
+LIMIT 20;
+```
+
+USDC-quoted books (`SOLUSDC`, `BTCUSDC`, `ETHUSDC`) are ordinary pairs and analyse normally. Recording both `SOLUSDT` and `SOLUSDC` lets you compare the same asset across quote currencies.
+
 ### Picking a window and bucket
 
 The bucket sets the shortest cycle you can see (about 4 bars) and the window sets the longest (about half the window). To measure a cycle of length *L*, record at least `3 × L` and pick a bucket near `L / 20`:
