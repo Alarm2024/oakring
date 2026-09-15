@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import signal
+import dataclasses
 import sqlite3
 import sys
 import tempfile
@@ -24,6 +25,7 @@ sys.path.insert(0, str(REPO_DIR))
 
 import analyze  # noqa: E402
 import common  # noqa: E402
+import venues  # noqa: E402
 import recorder  # noqa: E402
 
 
@@ -125,27 +127,25 @@ class MigrationTests(TempConfigCase):
 
 
 class RowBuildingTests(unittest.TestCase):
-    def test_valid_payload(self) -> None:
-        row = recorder.row_from_payload(
-            "2026-01-01T00:00:00Z", 1767225600, "SOLUSDT",
-            {"symbol": "SOLUSDT", "bidPrice": "100.0", "askPrice": "100.10", "bidQty": "5", "askQty": "3"},
-            None,
+    def test_valid_quote(self) -> None:
+        row = recorder.row_from_quote(
+            "2026-01-01T00:00:00Z", 1767225600, "SOLUSDT", "binance",
+            venues.Quote(100.0, 100.10, 5.0, 3.0), None,
         )
+        self.assertEqual(row[3], "binance")
         self.assertAlmostEqual(row[6], 100.05)
         self.assertAlmostEqual(row[7], 9.995, places=2)
         self.assertEqual(row[8], 5.0)
         self.assertIsNone(row[10])
 
-    def test_missing_and_bad_payloads(self) -> None:
-        missing = recorder.row_from_payload("t", 1, "X", None, "error:URLError")
+    def test_missing_and_crossed_quotes(self) -> None:
+        missing = recorder.row_from_quote("t", 1, "X", "binance", None, "error:URLError")
         self.assertEqual(missing[10], "error:URLError")
         self.assertIsNone(missing[6])
 
-        bad = recorder.row_from_payload("t", 1, "X", {"bidPrice": "oops", "askPrice": "1"}, None)
-        self.assertEqual(bad[10], "error:BadPayload")
-
-        crossed = recorder.row_from_payload("t", 1, "X", {"bidPrice": "10", "askPrice": "9"}, None)
+        crossed = recorder.row_from_quote("t", 1, "X", "kraken", venues.Quote(10.0, 9.0, 1.0, 1.0), None)
         self.assertEqual(crossed[10], "error:CrossedBook")
+        self.assertEqual(crossed[3], "kraken")
         self.assertIsNone(crossed[6])
 
     def test_tick_alignment_never_drifts(self) -> None:
@@ -197,7 +197,9 @@ class RecorderLoopTests(TempConfigCase):
         original, recorder.http_get_json = recorder.http_get_json, fake_get
         try:
             conn = common.connect(self.db_path)
-            recorder.run_tick(conn, "https://example.test", ["SOLUSDT", "BTCUSDT"], 5, 0)
+            venues.VENUES["binance"] = dataclasses.replace(
+                venues.VENUES["binance"], base_url="https://example.test")
+            recorder.run_tick(conn, {"binance": ["SOLUSDT", "BTCUSDT"]}, 5, 0)
         finally:
             recorder.http_get_json = original
 
@@ -214,7 +216,9 @@ class RecorderLoopTests(TempConfigCase):
         original, recorder.http_get_json = recorder.http_get_json, always_fails
         try:
             conn = common.connect(self.db_path)
-            recorder.run_tick(conn, "https://example.test", ["SOLUSDT"], 1, 0)
+            venues.VENUES["binance"] = dataclasses.replace(
+                venues.VENUES["binance"], base_url="https://example.test")
+            recorder.run_tick(conn, {"binance": ["SOLUSDT"]}, 1, 0)
         finally:
             recorder.http_get_json = original
 
@@ -304,24 +308,28 @@ class LocalServerTests(TempConfigCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_port}/api/v3/ticker/bookTicker"
+        self._binance = venues.VENUES["binance"]
+        venues.VENUES["binance"] = dataclasses.replace(self._binance, base_url=self.url)
 
     def tearDown(self) -> None:
+        venues.VENUES["binance"] = self._binance
         self.server.shutdown()
         self.server.server_close()
         super().tearDown()
 
     def test_single_pair_uses_symbol_and_batch_uses_symbols(self) -> None:
-        one = recorder.fetch_batch(self.url, ["SOLUSDT"], 5)
-        self.assertEqual(one["SOLUSDT"]["bidPrice"], "100.00")
+        venue = venues.VENUES["binance"]
+        one = recorder.fetch_venue(venue, ["SOLUSDT"], 5)
+        self.assertAlmostEqual(one["SOLUSDT"].bid, 100.0)
         self.assertIn("symbol=SOLUSDT", self.requests[-1])
 
-        many = recorder.fetch_batch(self.url, ["SOLUSDT", "BTCUSDT"], 5)
+        many = recorder.fetch_venue(venue, ["SOLUSDT", "BTCUSDT"], 5)
         self.assertEqual(sorted(many), ["BTCUSDT", "SOLUSDT"])
         self.assertIn("symbols=", self.requests[-1])
 
     def test_unknown_symbol_falls_back_so_good_pairs_still_record(self) -> None:
         conn = common.connect(self.db_path)
-        recorder.run_tick(conn, self.url, ["SOLUSDT", "NOPEUSDT"], 5, 0)
+        recorder.run_tick(conn, {"binance": ["SOLUSDT", "NOPEUSDT"]}, 5, 0)
         rows = {row["pair"]: row for row in conn.execute("SELECT pair, mid, note FROM ticks")}
         self.assertAlmostEqual(rows["SOLUSDT"]["mid"], 100.05)
         self.assertIsNone(rows["SOLUSDT"]["note"])
@@ -331,7 +339,7 @@ class LocalServerTests(TempConfigCase):
     def test_end_to_end_tick_then_report(self) -> None:
         conn = common.connect(self.db_path)
         for _ in range(3):
-            recorder.run_tick(conn, self.url, ["SOLUSDT"], 5, 0)
+            recorder.run_tick(conn, {"binance": ["SOLUSDT"]}, 5, 0)
         conn.close()
 
         buffer = io.StringIO()
@@ -459,7 +467,10 @@ class LatestSnapshotTests(TempConfigCase):
     def test_snapshot_prices_changes_and_missing_history(self) -> None:
         self.seed()
         conn = common.connect(self.db_path, read_only=True)
-        snapshot = {entry["pair"]: entry for entry in analyze.latest_snapshot(conn, ["SOLUSDT", "BTCUSDT"])}
+        snapshot = {
+            entry["pair"]: entry
+            for entry in analyze.latest_snapshot(conn, [("SOLUSDT", "binance"), ("BTCUSDT", "binance")])
+        }
         conn.close()
 
         sol = snapshot["SOLUSDT"]
@@ -482,7 +493,7 @@ class LatestSnapshotTests(TempConfigCase):
         )
         conn.close()
         conn = common.connect(self.db_path, read_only=True)
-        entry = analyze.latest_snapshot(conn, ["NEWUSDT"])[0]
+        entry = analyze.latest_snapshot(conn, [("NEWUSDT", "binance")])[0]
         conn.close()
         self.assertIn("no priced ticks", entry["status"])
 
@@ -490,7 +501,7 @@ class LatestSnapshotTests(TempConfigCase):
         """A bare "-" gets read as "this pair is broken"; it never means that."""
         self.seed()
         conn = common.connect(self.db_path, read_only=True)
-        snapshot = analyze.latest_snapshot(conn, ["SOLUSDT", "BTCUSDT"])
+        snapshot = analyze.latest_snapshot(conn, [("SOLUSDT", "binance"), ("BTCUSDT", "binance")])
         conn.close()
         rendered = analyze.render_latest(snapshot, stale_after=300)
         self.assertIn("not recording that long yet", rendered)
