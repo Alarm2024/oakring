@@ -277,7 +277,9 @@ TOKEN=$(sed -n 's/^ALERT_TELEGRAM_TOKEN=//p' ~/.config/oakring/.env)
 curl -s "https://api.telegram.org/bot$TOKEN/getUpdates" | head -c 600
 ```
 
-The id is `result[].message.chat.id` — negative for a group. Transports are independent, so a broken Telegram never stops Discord from delivering.
+The id is `result[].message.chat.id` — negative for a group. Put that number in `.env`; a chat id that is not a number (or `@channelname`) is reported as a configuration problem before anything is sent, rather than coming back as `chat not found`.
+
+Transports are independent, so a broken Telegram never stops Discord from delivering.
 
 ## Scheduled reports
 

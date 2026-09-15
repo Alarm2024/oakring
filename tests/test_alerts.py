@@ -205,6 +205,21 @@ class TransportTests(TempConfigCase):
         self.assertEqual(bodies["/discord"]["content"], "hello")
         self.assertEqual(bodies["/generic"]["text"], "hello")
 
+    def test_chat_id_shapes(self) -> None:
+        for good in ("8538514876", "-1001234567890", "@mychannel"):
+            self.assertTrue(alert.looks_like_chat_id(good), good)
+        for bad in ("THE_NUMBER", "", "@", "PASTE_CHAT_ID", "123abc"):
+            self.assertFalse(alert.looks_like_chat_id(bad), bad)
+
+    def test_an_unedited_placeholder_is_caught_before_sending(self) -> None:
+        env = {"ALERT_TELEGRAM_TOKEN": "123:SECRET", "ALERT_TELEGRAM_CHAT_ID": "THE_NUMBER"}
+        with self.assertLogs(level="WARNING") as captured:
+            self.assertEqual(alert.transports(env), [])
+        logged = "".join(captured.output)
+        self.assertIn("THE_NUMBER", logged)
+        self.assertIn("getUpdates", logged)
+        self.assertNotIn("SECRET", logged)
+
     def test_half_configured_telegram_is_reported_not_used(self) -> None:
         with self.assertLogs(level="WARNING") as captured:
             self.assertEqual(alert.transports({"ALERT_TELEGRAM_TOKEN": "123:SECRET"}), [])
