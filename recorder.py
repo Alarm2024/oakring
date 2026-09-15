@@ -9,6 +9,7 @@ visible to the analyzer instead of silently disappearing.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import signal
@@ -18,11 +19,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from datetime import timedelta
 
 import common
+import venues
 
-USER_AGENT = "oakring/2.0"
+USER_AGENT = "oakring/3.0"
 _shutdown = threading.Event()
 _shutdown_signal: int | None = None
 
@@ -46,48 +49,59 @@ def http_get_json(url: str, timeout: int) -> object:
         return json.loads(response.read().decode())
 
 
-def fetch_batch(base_url: str, pairs: list[str], timeout: int) -> dict[str, dict]:
-    """One request for the whole watchlist.
+def fetch_venue(venue: venues.Venue, pairs: list[str], timeout: int) -> dict[str, venues.Quote]:
+    """Top of book for these pairs on one venue, keyed by canonical pair.
 
-    Binance rejects the entire batch if a single symbol is unknown, so callers
-    fall back to per-pair requests when this raises.
+    Batched venues take the whole list in one request; the rest are asked one
+    pair at a time, so a single bad symbol costs only that symbol.
     """
-    if len(pairs) == 1:
-        query = urllib.parse.urlencode({"symbol": pairs[0]})
-    else:
-        query = urllib.parse.urlencode({"symbols": json.dumps(pairs, separators=(",", ":"))})
-    payload = http_get_json(f"{base_url}?{query}", timeout)
-    rows = payload if isinstance(payload, list) else [payload]
-    return {str(row["symbol"]).upper(): row for row in rows if isinstance(row, dict) and "symbol" in row}
+    quotes: dict[str, venues.Quote] = {}
+    groups = [pairs] if venue.batched else [[pair] for pair in pairs]
+
+    for group in groups:
+        if _shutdown.is_set():
+            break
+        symbols = [venue.to_symbol(pair) for pair in group]
+        payload = http_get_json(venue.build_url(venue.base_url, symbols), timeout)
+        parsed = venue.parse(payload, symbols[0])
+        for pair, symbol in zip(group, symbols):
+            quote = parsed.get(symbol) or parsed.get(pair.upper())
+            if quote is not None:
+                quotes[pair] = quote
+    return quotes
 
 
 def fetch_with_retries(
-    base_url: str, pairs: list[str], timeout: int, max_retries: int
-) -> tuple[dict[str, dict], str | None]:
-    """Batch fetch, retried with exponential backoff, then per-pair fallback."""
+    venue: venues.Venue, pairs: list[str], timeout: int, max_retries: int
+) -> tuple[dict[str, venues.Quote], str | None]:
+    """Fetch, retried with exponential backoff, then one pair at a time."""
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return fetch_batch(base_url, pairs, timeout), None
+            return fetch_venue(venue, pairs, timeout), None
         except Exception as exc:  # noqa: BLE001 - any failure is worth retrying
             last_error = exc
             if attempt < max_retries and not _shutdown.is_set():
                 delay = min(2.0**attempt, 30.0)
-                logging.warning("batch fetch failed (%s), retrying in %.0fs", _describe(exc), delay)
+                logging.warning(
+                    "%s fetch failed (%s), retrying in %.0fs", venue.name, _describe(exc), delay
+                )
                 _shutdown.wait(delay)
 
-    if len(pairs) == 1 or _shutdown.is_set():
+    if len(pairs) == 1 or not venue.batched or _shutdown.is_set():
         return {}, _describe(last_error)
 
-    logging.warning("batch fetch failed (%s), falling back to per-pair", _describe(last_error))
-    results: dict[str, dict] = {}
+    logging.warning(
+        "%s batch failed (%s), falling back to per-pair", venue.name, _describe(last_error)
+    )
+    results: dict[str, venues.Quote] = {}
     for pair in pairs:
         if _shutdown.is_set():
             break
         try:
-            results.update(fetch_batch(base_url, [pair], timeout))
+            results.update(fetch_venue(venue, [pair], timeout))
         except Exception as exc:  # noqa: BLE001
-            logging.warning("%s fetch failed: %s", pair, _describe(exc))
+            logging.warning("%s %s failed: %s", venue.name, pair, _describe(exc))
     return results, None if results else _describe(last_error)
 
 
@@ -98,6 +112,8 @@ def _describe(exc: Exception | None) -> str:
         return f"error:HTTPError:{exc.code}"
     if isinstance(exc, urllib.error.URLError):
         return "error:URLError"
+    if isinstance(exc, venues.VenueError):
+        return "error:VenueError"
     return f"error:{type(exc).__name__}"
 
 
@@ -107,21 +123,18 @@ def compute_mid_spread(bid: float, ask: float) -> tuple[float, float]:
     return mid, spread_bps
 
 
-def row_from_payload(ts: str, epoch: int, pair: str, payload: dict | None, fallback_note: str | None) -> tuple:
+def row_from_quote(
+    ts: str, epoch: int, pair: str, source: str, quote: venues.Quote | None, fallback_note: str | None
+) -> tuple:
     """Build one `ticks` row, valid or errored."""
-    if payload is None:
-        return (ts, epoch, pair, common.SOURCE, None, None, None, None, None, None, fallback_note or "error:Missing")
-    try:
-        bid = float(payload["bidPrice"])
-        ask = float(payload["askPrice"])
-        bid_qty = float(payload.get("bidQty", 0.0) or 0.0)
-        ask_qty = float(payload.get("askQty", 0.0) or 0.0)
-    except (KeyError, TypeError, ValueError):
-        return (ts, epoch, pair, common.SOURCE, None, None, None, None, None, None, "error:BadPayload")
-    if bid <= 0 or ask <= 0 or ask < bid:
-        return (ts, epoch, pair, common.SOURCE, bid, ask, None, None, bid_qty, ask_qty, "error:CrossedBook")
-    mid, spread_bps = compute_mid_spread(bid, ask)
-    return (ts, epoch, pair, common.SOURCE, bid, ask, mid, spread_bps, bid_qty, ask_qty, None)
+    if quote is None:
+        return (ts, epoch, pair, source, None, None, None, None, None, None, fallback_note or "error:Missing")
+    if quote.bid <= 0 or quote.ask <= 0 or quote.ask < quote.bid:
+        return (ts, epoch, pair, source, quote.bid, quote.ask, None, None,
+                quote.bid_qty, quote.ask_qty, "error:CrossedBook")
+    mid, spread_bps = compute_mid_spread(quote.bid, quote.ask)
+    return (ts, epoch, pair, source, quote.bid, quote.ask, mid, spread_bps,
+            quote.bid_qty, quote.ask_qty, None)
 
 
 def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
@@ -136,20 +149,42 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
     conn.commit()
 
 
-def run_tick(conn: sqlite3.Connection, base_url: str, pairs: list[str], timeout: int, max_retries: int) -> None:
+def run_tick(
+    conn: sqlite3.Connection,
+    watchlists: dict[str, list[str]],
+    timeout: int,
+    max_retries: int,
+) -> None:
+    """One round across every venue, all stamped with the same timestamp.
+
+    The shared timestamp is what makes cross-venue and cross-pair comparison
+    exact later: every leg of a comparison comes from the same instant.
+    """
     moment = common.now_utc()
     ts, epoch = common.to_ts_utc(moment), common.to_epoch(moment)
-    payloads, error = fetch_with_retries(base_url, pairs, timeout, max_retries)
+    rows: list[tuple] = []
 
-    rows = [row_from_payload(ts, epoch, pair, payloads.get(pair), error) for pair in pairs]
+    for name, pairs in watchlists.items():
+        try:
+            venue = venues.get(name)
+        except venues.VenueError as exc:
+            logging.error("%s", exc)
+            continue
+
+        quotes, error = fetch_with_retries(venue, pairs, timeout, max_retries)
+        for pair in pairs:
+            rows.append(row_from_quote(ts, epoch, pair, name, quotes.get(pair), error))
+
     insert_rows(conn, rows)
 
+    multi = len(watchlists) > 1
     for row in rows:
-        pair, bid, ask, mid, spread_bps, note = row[2], row[4], row[5], row[6], row[7], row[10]
+        pair, source, bid, ask, mid, spread_bps, note = row[2], row[3], row[4], row[5], row[6], row[7], row[10]
+        label = f"{source} {pair}" if multi else pair
         if note:
-            logging.warning("%s %s", pair, note)
+            logging.warning("%s %s", label, note)
         else:
-            logging.info("%s bid=%s ask=%s mid=%.8f spread_bps=%.2f", pair, bid, ask, mid, spread_bps)
+            logging.info("%s bid=%s ask=%s mid=%.8f spread_bps=%.2f", label, bid, ask, mid, spread_bps)
 
 
 def prune(conn: sqlite3.Connection, retention_days: int) -> int:
@@ -169,17 +204,62 @@ def next_tick_at(now: float, interval_sec: int) -> float:
     return (int(now // interval_sec) + 1) * interval_sec
 
 
+def probe(pairs: list[str], timeout: int) -> int:
+    """Ask every known venue for these pairs once, and report what came back.
+
+    This is the check that the parsers still match the live APIs - nothing
+    offline can prove that. Writes nothing to the database.
+    """
+    print(f"{'venue':<10} {'pair':<10} {'result'}")
+    failures = 0
+    for name in sorted(venues.VENUES):
+        venue = venues.get(name)
+        for pair in pairs:
+            try:
+                quote = fetch_venue(venue, [pair], timeout).get(pair)
+                if quote is None:
+                    raise venues.VenueError("no quote in the response")
+                mid, spread = compute_mid_spread(quote.bid, quote.ask)
+                print(
+                    f"{name:<10} {pair:<10} ok   bid={quote.bid:<12g} ask={quote.ask:<12g} "
+                    f"mid={mid:<12g} spread={spread:.2f}bps"
+                )
+            except Exception as exc:  # noqa: BLE001 - report, never raise
+                failures += 1
+                detail = getattr(exc, "reason", None) or exc
+                print(f"{name:<10} {pair:<10} FAILED  {_describe(exc)}: {str(detail)[:80]}")
+    if failures:
+        print(f"\n{failures} venue/pair combinations failed - only add the ones that say ok.")
+    return 1 if failures else 0
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Record top of book into SQLite.")
+    parser.add_argument(
+        "--probe",
+        nargs="*",
+        metavar="PAIR",
+        help="ask every venue for these pairs once, print the result, and exit "
+             "(default: SOLUSDC)",
+    )
+    args = parser.parse_args()
+
     env = common.load_config()
     common.setup_logging(env.get("LOG_LEVEL", "INFO"))
 
-    pairs = common.watchlist_from(env)
+    if args.probe is not None:
+        common.setup_logging(env.get("LOG_LEVEL", "WARNING"))
+        timeout = common.env_int(env, "HTTP_TIMEOUT_SEC", 15, minimum=1)
+        raise SystemExit(probe([pair.upper() for pair in args.probe] or ["SOLUSDC"], timeout))
+
+    watchlists = common.watchlists_from(env)
     interval_sec = common.env_int(env, "INTERVAL_SEC", 60, minimum=1)
     timeout = common.env_int(env, "HTTP_TIMEOUT_SEC", 15, minimum=1)
     max_retries = common.env_int(env, "MAX_RETRIES", 2, minimum=0)
     retention_days = common.env_int(env, "RETENTION_DAYS", 0, minimum=0)
     db_path = common.db_path_from(env)
-    base_url = env.get("BINANCE_URL", common.DEFAULT_BINANCE_URL)
+    if "BINANCE_URL" in env and env["BINANCE_URL"].strip():
+        venues.VENUES["binance"] = replace(venues.VENUES["binance"], base_url=env["BINANCE_URL"].strip())
 
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
@@ -187,9 +267,10 @@ def main() -> None:
     common.ensure_permissions(db_path)
     conn = common.connect(db_path)
 
+    for name, pairs in watchlists.items():
+        logging.info("recording %s on %s", ",".join(pairs), name)
     logging.info(
-        "recording %s every %ds into %s (retention=%s)",
-        ",".join(pairs),
+        "every %ds into %s (retention=%s)",
         interval_sec,
         db_path,
         f"{retention_days}d" if retention_days else "forever",
@@ -198,7 +279,7 @@ def main() -> None:
     last_prune = 0.0
     try:
         while not _shutdown.is_set():
-            run_tick(conn, base_url, pairs, timeout, max_retries)
+            run_tick(conn, watchlists, timeout, max_retries)
 
             now = time.time()
             if retention_days and now - last_prune > 3600:

@@ -73,6 +73,7 @@ python3 analyze.py --latest                              # price right now, ever
 python3 analyze.py --list-pairs                          # what has been recorded
 python3 analyze.py --auto                                # let it pick the settings
 python3 analyze.py --cross --since 12h                   # USDT vs USDC vs the peg
+python3 analyze.py --venues --since 12h                  # the same pair across exchanges
 python3 analyze.py --since 7d  --bucket 1h               # every pair, the default view
 python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
 python3 analyze.py --since 24h --bucket 15m --format json > report.json
@@ -83,6 +84,8 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 |------|---------|---------|
 | `--latest` | off | Current price per pair with 1h/24h/7d change, then exit |
 | `--cross` | off | USDT vs USDC books against the peg, over `--since`, then exit |
+| `--venues` | off | Compare each pair across the venues recording it, then exit |
+| `--venue` | all | Restrict any command to one venue |
 | `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
 | `--since` | `7d` | Window back from now (`90m`, `24h`, `7d`, `2w`) |
 | `--bucket` | `1h` | Resample size; the bar is the unit every cycle length is quoted in |
@@ -209,6 +212,60 @@ SOLUSDT  107.5547
 ```
 
 `move` is measured over the data that exists, which the `data` line states outright along with gaps and errors — so a report built on a broken recording says so.
+
+## More than one venue
+
+The `source` column records which exchange a row came from. Binance is polled from `WATCHLIST`; every other venue gets its own list, and a venue with no list is not polled at all:
+
+```bash
+WATCHLIST=SOLUSDT,BTCUSDT,ETHUSDT,USDCUSDT,SOLUSDC
+WATCHLIST_COINBASE=SOLUSDC
+WATCHLIST_KRAKEN=SOLUSDC
+WATCHLIST_OKX=SOLUSDC
+```
+
+Supported: `binance`, `coinbase`, `kraken`, `okx`, `bybit` — all public endpoints, no keys. Check a venue actually carries a pair before adding it:
+
+```bash
+python3 recorder.py --probe SOLUSDC
+```
+
+```
+venue      pair       result
+binance    SOLUSDC    ok   bid=100.48  ask=100.49  mid=100.485  spread=1.00bps
+coinbase   SOLUSDC    ok   bid=100.47  ask=100.50  mid=100.485  spread=2.99bps
+kraken     SOLUSDC    FAILED  error:VenueError: EQuery:Unknown asset pair
+```
+
+Only add the venues that say `ok`. The probe writes nothing.
+
+### Comparing them
+
+```bash
+python3 analyze.py --venues --since 12h
+```
+
+```
+SOLUSDC  2026-09-15T17:39:00Z  (binance, coinbase, kraken, okx)
+  binance   bid 100.1728  ask 100.1826  mid 100.1777
+  coinbase  bid 100.1669  ask 100.1909  mid 100.1789
+  kraken    bid 100.1517  ask 100.1927  mid 100.1722
+  okx       bid 100.1678  ask 100.1808  mid 100.1743
+  gap      +0.67 bps (kraken cheapest, coinbase dearest)
+  crossed  -0.80 bps now (best bid binance, best ask okx)
+  over 6.0h: mean gap 0.75, widest 1.48 bps at 2026-09-15T17:29:00Z
+  books crossed in 0.0% of 361 simultaneous ticks, at most +0.00 bps
+```
+
+`gap` is how far apart the mids are. `crossed` is the best bid anywhere minus the best ask anywhere — positive means one venue's bid sits above another's ask.
+
+Only ticks where every venue priced are compared, since a fresh book against a missing one would invent a gap that was never there. All venues in a round share one timestamp, so these are simultaneous quotes.
+
+**A crossed book is not free money.** Taker fees, withdrawal cost and transfer time all sit between the two sides and none are counted. This measures disagreement between venues, nothing more — the tool prints that caveat itself.
+
+### Everything else stays venue-aware
+
+Once a pair is on more than one venue, `--latest` and the cycle reports label it `SOLUSDC@kraken` and analyse each venue separately — two venues' books folding into one series would be meaningless. `--venue kraken` restricts any command to one venue and drops the suffix.
 
 ## The USDT / USDC cross
 
@@ -399,7 +456,8 @@ python3 -m unittest discover -s tests -v
 
 | File | Purpose |
 |------|---------|
-| `recorder.py` | Poll loop: batched fetch, retries, error rows, pruning, clean shutdown |
+| `recorder.py` | Poll loop: every venue, retries, error rows, pruning, clean shutdown |
+| `venues.py` | Per-exchange symbols, URLs and response parsing |
 | `report.sh` | Writes a timestamped report; what the timer runs |
 | `check.sh` | Health check: services, freshness, errors, prices |
 | `health.py` | The checks themselves, shared by check.sh and alert.py |

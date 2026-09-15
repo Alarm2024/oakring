@@ -89,6 +89,26 @@ def list_pairs(conn) -> list[tuple[str, int, str, str]]:
     return [(r["pair"], r["n"], r["first_ts"], r["last_ts"]) for r in rows]
 
 
+def recorded_keys(conn, wanted: list[str] | None = None, venue: str | None = None) -> list[tuple[str, str]]:
+    """Every (pair, venue) actually recorded, filtered by what was asked for."""
+    rows = conn.execute("SELECT DISTINCT pair, source FROM ticks ORDER BY pair, source").fetchall()
+    keys = [(row["pair"], row["source"]) for row in rows]
+    if wanted:
+        names = {name.upper() for name in wanted}
+        keys = [key for key in keys if key[0].upper() in names]
+    if venue:
+        keys = [key for key in keys if key[1].lower() == venue.lower()]
+    return keys
+
+
+def venue_count(conn) -> int:
+    return int(conn.execute("SELECT COUNT(DISTINCT source) FROM ticks").fetchone()[0] or 0)
+
+
+def label_for(pair: str, source: str, show_venue: bool) -> str:
+    return f"{pair}@{source}" if show_venue else pair
+
+
 def choose_bucket(span_sec: int) -> int:
     """A round bucket that turns `span_sec` of recording into ~TARGET_BARS bars."""
     target = max(60, span_sec / TARGET_BARS)
@@ -110,33 +130,35 @@ def choose_swing(bars: list[Bar]) -> float:
     return round(min(10.0, max(0.1, 3.0 * statistics.fmean(moves) * 100.0)), 2)
 
 
-def recorded_span(conn, pair: str, start: int, end: int) -> int:
+def recorded_span(conn, pair: str, start: int, end: int, source: str | None = None) -> int:
     """Seconds between the first and last priced tick for this pair in the window."""
     row = conn.execute(
         f"""
         SELECT MIN({EPOCH_SQL}) AS first_epoch, MAX({EPOCH_SQL}) AS last_epoch
         FROM ticks
-        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+        WHERE pair = ? {"AND source = ?" if source else ""} AND note IS NULL AND mid IS NOT NULL
           AND {EPOCH_SQL} BETWEEN ? AND ?
         """,
-        (pair, start, end),
+        (pair, source, start, end) if source else (pair, start, end),
     ).fetchone()
     if row is None or row["first_epoch"] is None:
         return 0
     return max(0, int(row["last_epoch"]) - int(row["first_epoch"]))
 
 
-def _change_since(conn, pair: str, last_epoch: int, last_mid: float, window: int) -> float | None:
+def _change_since(
+    conn, pair: str, source: str, last_epoch: int, last_mid: float, window: int
+) -> float | None:
     """Percent change against the last priced tick at or before `window` ago."""
     target = last_epoch - window
     row = conn.execute(
         f"""
         SELECT mid, {EPOCH_SQL} AS epoch
         FROM ticks
-        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL AND {EPOCH_SQL} <= ?
+        WHERE pair = ? AND source = ? AND note IS NULL AND mid IS NOT NULL AND {EPOCH_SQL} <= ?
         ORDER BY epoch DESC LIMIT 1
         """,
-        (pair, target),
+        (pair, source, target),
     ).fetchone()
     if row is None or not row["mid"]:
         return None
@@ -146,28 +168,33 @@ def _change_since(conn, pair: str, last_epoch: int, last_mid: float, window: int
     return round(100.0 * (last_mid / float(row["mid"]) - 1.0), 3)
 
 
-def latest_snapshot(conn, pairs: list[str]) -> list[dict]:
-    """Most recent priced tick per pair, with short-horizon changes."""
+def latest_snapshot(conn, keys: list[tuple[str, str]], show_venue: bool = False) -> list[dict]:
+    """Most recent priced tick per (pair, venue), with short-horizon changes."""
     now = common.to_epoch(common.now_utc())
     snapshot: list[dict] = []
-    for pair in pairs:
+    for pair, source in keys:
         row = conn.execute(
             f"""
             SELECT ts_utc, {EPOCH_SQL} AS epoch, bid, ask, mid, spread_bps
             FROM ticks
-            WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+            WHERE pair = ? AND source = ? AND note IS NULL AND mid IS NOT NULL
             ORDER BY epoch DESC LIMIT 1
             """,
-            (pair,),
+            (pair, source),
         ).fetchone()
         if row is None:
-            snapshot.append({"pair": pair, "status": "no priced ticks recorded yet"})
+            snapshot.append({
+                "pair": label_for(pair, source, show_venue),
+                "venue": source,
+                "status": "no priced ticks recorded yet",
+            })
             continue
 
         last_epoch, last_mid = int(row["epoch"]), float(row["mid"])
         age = max(0, now - last_epoch)
         entry = {
-            "pair": pair,
+            "pair": label_for(pair, source, show_venue),
+            "venue": source,
             "at": row["ts_utc"],
             "age_sec": age,
             "age_human": common.format_duration(age),
@@ -177,16 +204,17 @@ def latest_snapshot(conn, pairs: list[str]) -> list[dict]:
             "spread_bps": row["spread_bps"],
         }
         for label, window in (("1h", 3600), ("24h", 86400), ("7d", 604800)):
-            entry[f"change_{label}_pct"] = _change_since(conn, pair, last_epoch, last_mid, window)
+            entry[f"change_{label}_pct"] = _change_since(conn, pair, source, last_epoch, last_mid, window)
         snapshot.append(entry)
     return snapshot
 
 
 def render_latest(snapshot: list[dict], stale_after: int) -> str:
-    lines = [f"{'pair':<10} {'price':>14} {'spread':>10} {'age':>8} {'1h':>9} {'24h':>9} {'7d':>9}"]
+    width = max([10] + [len(entry["pair"]) for entry in snapshot]) + 1
+    lines = [f"{'pair':<{width}} {'price':>14} {'spread':>10} {'age':>8} {'1h':>9} {'24h':>9} {'7d':>9}"]
     for entry in snapshot:
         if "status" in entry:
-            lines.append(f"{entry['pair']:<10} {entry['status']}")
+            lines.append(f"{entry['pair']:<{width}} {entry['status']}")
             continue
         changes = []
         for label in ("1h", "24h", "7d"):
@@ -194,7 +222,7 @@ def render_latest(snapshot: list[dict], stale_after: int) -> str:
             changes.append("-" if value is None else f"{value:+.2f}%")
         stale = "  (stale - is the recorder running?)" if entry["age_sec"] > stale_after else ""
         lines.append(
-            f"{entry['pair']:<10} {price_fmt(entry['mid']):>14} "
+            f"{entry['pair']:<{width}} {price_fmt(entry['mid']):>14} "
             f"{entry['spread_bps']:>7.2f}bps {entry['age_human']:>8} "
             f"{changes[0]:>9} {changes[1]:>9} {changes[2]:>9}{stale}"
         )
@@ -234,7 +262,7 @@ def cross_bases(conn, pairs: list[str] | None = None) -> list[str]:
     return bases
 
 
-def cross_series(conn, base: str, start: int, end: int) -> list[dict]:
+def cross_series(conn, base: str, start: int, end: int, source: str = "binance") -> list[dict]:
     """Per tick: what the two books imply about USDC, and what the peg actually says.
 
     The recorder stamps every pair in a tick with one timestamp, so the three
@@ -250,7 +278,7 @@ def cross_series(conn, base: str, start: int, end: int) -> list[dict]:
                MAX(CASE WHEN pair = ? THEN spread_bps END) AS usdc_spread,
                MAX(CASE WHEN pair = ? THEN spread_bps END) AS peg_spread
         FROM ticks
-        WHERE pair IN (?, ?, ?) AND note IS NULL AND mid IS NOT NULL
+        WHERE pair IN (?, ?, ?) AND source = ? AND note IS NULL AND mid IS NOT NULL
           AND {EPOCH_SQL} BETWEEN ? AND ?
         GROUP BY epoch
         HAVING usdt IS NOT NULL AND usdc IS NOT NULL AND peg IS NOT NULL
@@ -260,7 +288,7 @@ def cross_series(conn, base: str, start: int, end: int) -> list[dict]:
             f"{base}USDT", f"{base}USDC", PEG_PAIR,
             f"{base}USDT", f"{base}USDC", PEG_PAIR,
             f"{base}USDT", f"{base}USDC", PEG_PAIR,
-            start, end,
+            source, start, end,
         ),
     ).fetchall()
 
@@ -292,8 +320,8 @@ def cross_series(conn, base: str, start: int, end: int) -> list[dict]:
     return series
 
 
-def cross_report(conn, base: str, start: int, end: int) -> dict:
-    series = cross_series(conn, base, start, end)
+def cross_report(conn, base: str, start: int, end: int, source: str = "binance") -> dict:
+    series = cross_series(conn, base, start, end, source)
     if not series:
         return {"base": base, "status": "no tick has all three legs priced yet"}
 
@@ -367,18 +395,145 @@ def render_cross(reports: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def load_bars(conn, pair: str, start: int, end: int, bucket: int) -> list[Bar]:
-    """Fold ticks into OHLC buckets. Error rows count but never move the price."""
-    cursor = conn.execute(
-        """
-        SELECT COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER)) AS epoch,
-               mid, spread_bps, bid_qty, ask_qty, note
+def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
+    """Per tick, every venue's book for one pair - only ticks all of them priced.
+
+    The recorder stamps every venue in a round with one timestamp, so these are
+    simultaneous quotes rather than a stale book compared against a fresh one.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT {EPOCH_SQL} AS epoch, source, bid, ask, mid
         FROM ticks
-        WHERE pair = ?
-          AND COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER)) BETWEEN ? AND ?
+        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
         ORDER BY epoch
         """,
         (pair, start, end),
+    ).fetchall()
+
+    by_epoch: dict[int, dict[str, dict]] = {}
+    for row in rows:
+        by_epoch.setdefault(int(row["epoch"]), {})[row["source"]] = {
+            "bid": float(row["bid"]), "ask": float(row["ask"]), "mid": float(row["mid"])
+        }
+
+    sources = {source for books in by_epoch.values() for source in books}
+    if len(sources) < 2:
+        return []
+
+    series = []
+    for epoch in sorted(by_epoch):
+        books = by_epoch[epoch]
+        if len(books) < 2:
+            continue  # a venue missed this round; comparing would be misleading
+        best_bid_venue = max(books, key=lambda name: books[name]["bid"])
+        best_ask_venue = min(books, key=lambda name: books[name]["ask"])
+        mids = {name: book["mid"] for name, book in books.items()}
+        cheapest, dearest = min(mids, key=mids.get), max(mids, key=mids.get)
+        reference = statistics.fmean(mids.values())
+        series.append({
+            "epoch": epoch,
+            "books": books,
+            "best_bid_venue": best_bid_venue,
+            "best_ask_venue": best_ask_venue,
+            # Positive means somebody's bid sits above somebody else's ask.
+            "cross_bps": (books[best_bid_venue]["bid"] - books[best_ask_venue]["ask"]) / reference * 10000.0,
+            "spread_bps": (mids[dearest] - mids[cheapest]) / reference * 10000.0,
+            "cheapest": cheapest,
+            "dearest": dearest,
+        })
+    return series
+
+
+def venue_report(conn, pair: str, start: int, end: int) -> dict:
+    series = venue_series(conn, pair, start, end)
+    if not series:
+        return {"pair": pair, "status": "needs two venues priced in the same tick"}
+
+    spreads = [point["spread_bps"] for point in series]
+    crossed = [point for point in series if point["cross_bps"] > 0]
+    widest = max(series, key=lambda point: point["spread_bps"])
+    last = series[-1]
+
+    return {
+        "pair": pair,
+        "ticks": len(series),
+        "venues": sorted(last["books"]),
+        "span_human": common.format_duration(series[-1]["epoch"] - series[0]["epoch"]),
+        "last": {
+            "at": common.to_ts_utc(common.from_epoch(last["epoch"])),
+            "books": {name: dict(book) for name, book in last["books"].items()},
+            "cheapest": last["cheapest"],
+            "dearest": last["dearest"],
+            "spread_bps": round(last["spread_bps"], 3),
+            "cross_bps": round(last["cross_bps"], 3),
+            "best_bid_venue": last["best_bid_venue"],
+            "best_ask_venue": last["best_ask_venue"],
+        },
+        "spread_mean_bps": round(statistics.fmean(spreads), 3),
+        "spread_max_bps": round(widest["spread_bps"], 3),
+        "spread_max_at": common.to_ts_utc(common.from_epoch(widest["epoch"])),
+        "crossed_ticks": len(crossed),
+        "crossed_pct": round(100.0 * len(crossed) / len(series), 2),
+        "crossed_max_bps": round(max((point["cross_bps"] for point in crossed), default=0.0), 3),
+    }
+
+
+def render_venues(reports: list[dict]) -> str:
+    lines = []
+    for report in reports:
+        lines.append("")
+        if "status" in report:
+            lines.append(f"{report['pair']}: {report['status']}")
+            continue
+        last = report["last"]
+        lines.append(f"{report['pair']}  {last['at']}  ({', '.join(report['venues'])})")
+        for name in sorted(last["books"]):
+            book = last["books"][name]
+            lines.append(
+                f"  {name:<9} bid {price_fmt(book['bid'])}  ask {price_fmt(book['ask'])}"
+                f"  mid {price_fmt(book['mid'])}"
+            )
+        lines.append(
+            f"  gap      {last['spread_bps']:+.2f} bps "
+            f"({last['cheapest']} cheapest, {last['dearest']} dearest)"
+        )
+        lines.append(
+            f"  crossed  {last['cross_bps']:+.2f} bps now "
+            f"(best bid {last['best_bid_venue']}, best ask {last['best_ask_venue']})"
+        )
+        lines.append(
+            f"  over {report['span_human']}: mean gap {report['spread_mean_bps']:.2f}, "
+            f"widest {report['spread_max_bps']:.2f} bps at {report['spread_max_at']}"
+        )
+        lines.append(
+            f"  books crossed in {report['crossed_pct']}% of {report['ticks']} "
+            f"simultaneous ticks, at most {report['crossed_max_bps']:+.2f} bps"
+        )
+    if any("status" not in report for report in reports):
+        lines.append("")
+        lines.append("A crossed book across venues is not free money: taker fees, withdrawal")
+        lines.append("cost and transfer time all sit between the two sides, and none are")
+        lines.append("counted here. This measures how far the venues disagree, nothing more.")
+    return "\n".join(lines)
+
+
+def load_bars(conn, pair: str, start: int, end: int, bucket: int, source: str | None = None) -> list[Bar]:
+    """Fold ticks into OHLC buckets. Error rows count but never move the price.
+
+    `source` matters once the same pair is recorded on more than one venue:
+    without it two venues' books would fold into one nonsense series.
+    """
+    cursor = conn.execute(
+        f"""
+        SELECT {EPOCH_SQL} AS epoch, mid, spread_bps, bid_qty, ask_qty, note
+        FROM ticks
+        WHERE pair = ? {"AND source = ?" if source else ""}
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        ORDER BY epoch
+        """,
+        (pair, source, start, end) if source else (pair, start, end),
     )
 
     bars: list[Bar] = []
@@ -915,6 +1070,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format: text, brief (phone sized), json, csv (default: text)",
     )
     parser.add_argument("--list-pairs", action="store_true", help="list recorded pairs and exit")
+    parser.add_argument("--venue", help="restrict to one venue (binance, coinbase, kraken, okx, bybit)")
+    parser.add_argument(
+        "--venues",
+        action="store_true",
+        help="compare each pair's book across the venues recording it, and exit",
+    )
     parser.add_argument(
         "--cross",
         action="store_true",
@@ -956,6 +1117,34 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{pair:<12} {count:>8}  {first_ts}  {last_ts}")
             return 0
 
+        if args.venues:
+            try:
+                since_sec = common.parse_duration(args.since)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            end_epoch = common.to_epoch(common.now_utc())
+            pairs = sorted({pair for pair, _ in recorded_keys(conn, args.pairs)})
+            multi = [
+                pair for pair in pairs
+                if len({source for _, source in recorded_keys(conn, [pair])}) > 1
+            ]
+            if not multi:
+                print(
+                    "no pair is recorded on more than one venue - add e.g. "
+                    "WATCHLIST_COINBASE=SOLUSDC to the .env file",
+                    file=sys.stderr,
+                )
+                return 1
+            reports = [venue_report(conn, pair, end_epoch - since_sec, end_epoch) for pair in multi]
+            if args.format == "json":
+                print(json.dumps({"venues": reports}, indent=2))
+            else:
+                print("oakring venues  |  the same pair, side by side")
+                print(render_venues(reports))
+                print("")
+            return 0
+
         if args.cross:
             try:
                 since_sec = common.parse_duration(args.since)
@@ -971,7 +1160,10 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            reports = [cross_report(conn, base, end_epoch - since_sec, end_epoch) for base in bases]
+            source = args.venue or "binance"
+            reports = [
+                cross_report(conn, base, end_epoch - since_sec, end_epoch, source) for base in bases
+            ]
             if args.format == "json":
                 print(json.dumps({"cross": reports}, indent=2))
             else:
@@ -981,8 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if args.latest:
-            pairs = args.pairs or [row[0] for row in list_pairs(conn)]
-            if not pairs:
+            keys = recorded_keys(conn, args.pairs, args.venue)
+            if not keys:
                 print("no ticks recorded yet", file=sys.stderr)
                 return 1
             try:
@@ -990,7 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
-            snapshot = latest_snapshot(conn, [pair.upper() for pair in pairs])
+            snapshot = latest_snapshot(conn, keys, show_venue=venue_count(conn) > 1 and not args.venue)
             if args.format == "json":
                 print(json.dumps({"latest": snapshot}, indent=2))
             else:
@@ -1020,35 +1212,36 @@ def main(argv: list[str] | None = None) -> int:
             "length": common.format_duration(since_sec),
         }
 
-        pairs = args.pairs or [row[0] for row in list_pairs(conn)]
-        if not pairs:
+        keys = recorded_keys(conn, args.pairs, args.venue)
+        if not keys:
             print("no ticks recorded yet", file=sys.stderr)
             return 1
+        show_venue = venue_count(conn) > 1 and not args.venue
 
         reports: list[PairReport] = []
         csv_chunks: list[str] = []
         empty: list[str] = []
 
-        for pair in pairs:
-            pair = pair.upper()
+        for pair, source in keys:
+            label = label_for(pair, source, show_venue)
             pair_bucket, pair_swing = bucket, args.swing
 
             if args.auto:
-                span = recorded_span(conn, pair, start_epoch, end_epoch)
+                span = recorded_span(conn, pair, start_epoch, end_epoch, source)
                 if span:
                     pair_bucket = choose_bucket(span)
 
-            bars = load_bars(conn, pair, start_epoch, end_epoch, pair_bucket)
+            bars = load_bars(conn, pair, start_epoch, end_epoch, pair_bucket, source)
             if not bars:
-                empty.append(pair)
+                empty.append(label)
                 continue
             if args.auto:
                 pair_swing = choose_swing(bars)
 
             if args.format == "csv":
-                csv_chunks.append(render_csv(pair, bars))
+                csv_chunks.append(render_csv(label, bars))
             else:
-                reports.append(analyse_pair(bars, pair, pair_bucket, pair_swing, window))
+                reports.append(analyse_pair(bars, label, pair_bucket, pair_swing, window))
 
         if args.format == "csv":
             if not csv_chunks:

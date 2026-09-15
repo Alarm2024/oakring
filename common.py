@@ -69,6 +69,9 @@ def load_config() -> dict[str, str]:
     for key in list(EXPECTED_ENV_KEYS):
         if key in os.environ:
             env[key] = os.environ[key]
+    for key, value in os.environ.items():
+        if key.startswith("WATCHLIST_") or key.startswith("ALERT_"):
+            env[key] = value
     return env
 
 
@@ -112,6 +115,24 @@ def watchlist_from(env: dict[str, str]) -> list[str]:
         if pair and pair not in pairs:
             pairs.append(pair)
     return pairs or ["SOLUSDT"]
+
+
+def watchlists_from(env: dict[str, str]) -> dict[str, list[str]]:
+    """Which pairs to record on which venue.
+
+    WATCHLIST is binance, unchanged. Any other venue is turned on by giving it
+    its own list, e.g. WATCHLIST_COINBASE=SOLUSDC - a venue with no list is
+    simply not polled.
+    """
+    watchlists: dict[str, list[str]] = {"binance": watchlist_from(env)}
+    for key, value in env.items():
+        if not key.startswith("WATCHLIST_"):
+            continue
+        name = key[len("WATCHLIST_") :].strip().lower()
+        pairs = watchlist_from({"WATCHLIST": value}) if value.strip() else []
+        if name and pairs:
+            watchlists[name] = pairs
+    return watchlists
 
 
 def ensure_permissions(db_path: Path) -> None:
