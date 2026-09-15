@@ -84,12 +84,29 @@ def should_notify(report: dict, state: dict, repeat_sec: int, now: float) -> tup
     return False, "no change"
 
 
+def looks_like_chat_id(value: str) -> bool:
+    """A Telegram chat id is an integer, or @name for a public channel."""
+    if value.startswith("@"):
+        return len(value) > 1
+    return value.lstrip("-").isdigit()
+
+
 def transports(env: dict) -> list[tuple[str, str, dict]]:
     """(name, url, payload-template) for every configured destination."""
     configured: list[tuple[str, str, dict]] = []
 
     token = env.get("ALERT_TELEGRAM_TOKEN", "").strip()
     chat_id = env.get("ALERT_TELEGRAM_CHAT_ID", "").strip()
+    if token and chat_id and not looks_like_chat_id(chat_id):
+        # Catch an unedited placeholder here rather than as "chat not found"
+        # from Telegram three steps later.
+        logging.warning(
+            "ALERT_TELEGRAM_CHAT_ID=%r is not a chat id - it should be a number "
+            "(from https://api.telegram.org/bot<token>/getUpdates) or @channelname",
+            chat_id,
+        )
+        chat_id = ""
+
     if token and chat_id:
         # The token is in the URL, so this URL must never reach a log line.
         configured.append(
