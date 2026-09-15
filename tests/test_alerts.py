@@ -162,14 +162,15 @@ class TransportTests(TempConfigCase):
 
         class Handler(BaseHTTPRequestHandler):
             status = 200
+            body = b"ok"
 
             def do_POST(self) -> None:  # noqa: N802 - http.server API
                 body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                 received.append((self.path, json.loads(body.decode())))
                 self.send_response(self.status)
-                self.send_header("Content-Length", "2")
+                self.send_header("Content-Length", str(len(self.body)))
                 self.end_headers()
-                self.wfile.write(b"ok")
+                self.wfile.write(self.body)
 
             def log_message(self, *args: object) -> None:
                 pass
@@ -209,6 +210,26 @@ class TransportTests(TempConfigCase):
             self.assertEqual(alert.transports({"ALERT_TELEGRAM_TOKEN": "123:SECRET"}), [])
         self.assertIn("ALERT_TELEGRAM_CHAT_ID", captured.output[0])
         self.assertNotIn("SECRET", "".join(captured.output))
+
+    def test_the_api_reason_reaches_the_log(self) -> None:
+        """A bare status code is not actionable; Telegram explains 400 in the body."""
+        self.handler.status = 400
+        self.handler.body = b'{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}'
+        with self.assertLogs(level="ERROR") as captured:
+            alert.send("telegram", f"{self.base}/send", {"text": None}, "hello")
+        self.assertIn("chat not found", "".join(captured.output))
+
+    def test_an_echoed_secret_in_the_body_is_redacted(self) -> None:
+        self.handler.status = 400
+        self.handler.body = b'{"description":"bad token 123:SUPERSECRETTOKEN"}'
+        with self.assertLogs(level="ERROR") as captured:
+            alert.send(
+                "telegram", f"{self.base}/send", {"text": None}, "hello",
+                secrets=("123:SUPERSECRETTOKEN",),
+            )
+        logged = "".join(captured.output)
+        self.assertNotIn("SUPERSECRET", logged)
+        self.assertIn("***", logged)
 
     def test_a_failing_transport_never_logs_the_url(self) -> None:
         """A telegram URL contains the bot token, so it must not reach a log."""
