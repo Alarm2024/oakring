@@ -104,7 +104,9 @@ ETHUSDT          2,533.45    0.02bps      45s    -0.02%         -         -
 SOLUSDT          100.4032    1.00bps      45s    +0.66%    +0.03%    +0.20%
 ```
 
-A `-` means that pair has not been recording long enough for that horizon yet, not that nothing moved. `age` is how long ago the last priced tick landed — anything over `--stale-after` is marked, which is the quickest way to notice the recorder has stopped.
+A `-` means that pair has not been recording long enough for that horizon yet — a pair added this morning has a 1h figure but no 24h one. It never means the pair stopped recording, and the table says so beneath itself whenever a `-` appears. **`age` is the column that tells you something is wrong**: it is how long ago the last priced tick landed, and anything over `--stale-after` is marked.
+
+To confirm everything is recording, compare the hourly tick count in `./check.sh` against pairs x 60 — `0 of 420` across 7 pairs means every pair was polled every minute of the last hour with no failures.
 
 ### Reading the report
 
