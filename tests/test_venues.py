@@ -186,7 +186,7 @@ class MultiVenueRecordingTests(unittest.TestCase):
         conn = common.connect(self.db_path)
         recorder.run_tick(
             conn,
-            {"binance": ["SOLUSDC"], "coinbase": ["SOLUSDC"], "kraken": ["SOLUSDC"], "okx": ["SOLUSDC"]},
+            {name: {"SOLUSDC": "SOLUSDC"} for name in ("binance", "coinbase", "kraken", "okx")},
             5,
             0,
         )
@@ -205,13 +205,70 @@ class MultiVenueRecordingTests(unittest.TestCase):
             venues.VENUES["kraken"], base_url="http://127.0.0.1:1"
         )
         conn = common.connect(self.db_path)
-        recorder.run_tick(conn, {"binance": ["SOLUSDC"], "kraken": ["SOLUSDC"]}, 2, 0)
+        recorder.run_tick(
+            conn, {"binance": {"SOLUSDC": "SOLUSDC"}, "kraken": {"SOLUSDC": "SOLUSDC"}}, 2, 0
+        )
         rows = {row["source"]: row for row in conn.execute("SELECT source, mid, note FROM ticks")}
         conn.close()
 
         self.assertIsNotNone(rows["binance"]["mid"])
         self.assertIsNone(rows["kraken"]["mid"])
         self.assertTrue(rows["kraken"]["note"].startswith("error:"))
+
+
+class SymbolAliasTests(unittest.TestCase):
+    """The same market under a different name on another exchange."""
+
+    def test_alias_parsing(self) -> None:
+        self.assertEqual(common.parse_watchlist("SOLUSDC"), {"SOLUSDC": "SOLUSDC"})
+        self.assertEqual(common.parse_watchlist("SOLUSDC:SOLUSD"), {"SOLUSDC": "SOLUSD"})
+        self.assertEqual(
+            common.parse_watchlist(" solusdc:solusd , btcusdc "),
+            {"SOLUSDC": "SOLUSD", "BTCUSDC": "BTCUSDC"},
+        )
+        self.assertEqual(common.parse_watchlist(""), {})
+        self.assertEqual(common.parse_watchlist("SOLUSDC:"), {"SOLUSDC": "SOLUSDC"})
+
+    def test_watchlists_carry_the_alias(self) -> None:
+        env = {"WATCHLIST": "SOLUSDT", "WATCHLIST_COINBASE": "SOLUSDC:SOLUSD"}
+        self.assertEqual(
+            common.watchlists_from(env),
+            {"binance": {"SOLUSDT": "SOLUSDT"}, "coinbase": {"SOLUSDC": "SOLUSD"}},
+        )
+
+    def test_alias_asks_for_one_name_and_stores_the_other(self) -> None:
+        """Coinbase has no SOL-USDC; SOL-USD is that book, and must land as SOLUSDC."""
+        asked: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                asked.append(self.path)
+                payload = json.dumps(SAMPLES["coinbase"]["payload"]).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        original = venues.VENUES["coinbase"]
+        venues.VENUES["coinbase"] = dataclasses.replace(
+            original, base_url=f"http://127.0.0.1:{server.server_port}"
+        )
+        try:
+            quotes = recorder.fetch_venue(venues.VENUES["coinbase"], {"SOLUSDC": "SOLUSD"}, 5)
+        finally:
+            venues.VENUES["coinbase"] = original
+            server.shutdown()
+            server.server_close()
+
+        self.assertIn("/products/SOL-USD/book", asked[0], "must ask for the venue's own name")
+        self.assertNotIn("USDC", asked[0])
+        self.assertIn("SOLUSDC", quotes, "must be stored under the canonical name")
+        self.assertGreater(quotes["SOLUSDC"].bid, 100.0)
 
 
 class VenueComparisonTests(unittest.TestCase):

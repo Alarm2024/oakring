@@ -224,18 +224,32 @@ WATCHLIST_KRAKEN=SOLUSDC
 WATCHLIST_OKX=SOLUSDC
 ```
 
-Supported: `binance`, `coinbase`, `kraken`, `okx`, `bybit` — all public endpoints, no keys. Check a venue actually carries a pair before adding it:
+Supported: `binance`, `coinbase`, `kraken`, `okx`, `bybit` — all public endpoints, no keys.
+
+Exchanges do not agree on names, and sometimes not on which pairs exist. `PAIR:VENUE_PAIR` records under the first name and asks the venue for the second:
 
 ```bash
-python3 recorder.py --probe SOLUSDC
+WATCHLIST_COINBASE=SOLUSDC:SOLUSD
+```
+
+Coinbase lists no `SOL-USDC` at all — USD and USDC are interchangeable there, so `SOL-USD` *is* that book. Recording it as `SOLUSDC` puts it beside the other venues' SOL/USDC instead of stranding it under a name nothing else shares.
+
+Check a venue actually carries a pair before adding it:
+
+```bash
+python3 recorder.py --probe SOLUSDC SOLUSDC:SOLUSD
 ```
 
 ```
 venue      pair       result
-binance    SOLUSDC    ok   bid=100.48  ask=100.49  mid=100.485  spread=1.00bps
-coinbase   SOLUSDC    ok   bid=100.47  ask=100.50  mid=100.485  spread=2.99bps
-kraken     SOLUSDC    FAILED  error:VenueError: EQuery:Unknown asset pair
+binance    SOLUSDC    ok   bid=99.81  ask=99.82  mid=99.815  spread=1.00bps
+coinbase   SOL-USDC   FAILED  error:HTTPError:404: Not Found
+coinbase   SOL-USD    ok   bid=99.80  ask=99.83  mid=99.815  spread=3.01bps
+kraken     SOLUSDC    ok   bid=99.79  ask=99.84  mid=99.815  spread=5.01bps
+okx        SOL-USDC   ok   bid=99.81  ask=99.83  mid=99.82   spread=2.00bps
 ```
+
+The probe prints each venue's own spelling, so a 404 tells you the name is wrong rather than the venue being down.
 
 Only add the venues that say `ok`. The probe writes nothing.
 

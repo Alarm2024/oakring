@@ -117,19 +117,41 @@ def watchlist_from(env: dict[str, str]) -> list[str]:
     return pairs or ["SOLUSDT"]
 
 
-def watchlists_from(env: dict[str, str]) -> dict[str, list[str]]:
-    """Which pairs to record on which venue.
+def parse_watchlist(raw: str) -> dict[str, str]:
+    """Pairs to record, mapped to what this venue calls them.
+
+    Plain `SOLUSDC` means both. `SOLUSDC:SOLUSD` records under SOLUSDC but asks
+    the venue for SOLUSD - which is how the same market gets compared across
+    exchanges that name it differently. Coinbase, for one, has no SOL-USDC at
+    all: USD and USDC are interchangeable there, so SOL-USD is that book.
+    """
+    pairs: dict[str, str] = {}
+    for item in raw.split(","):
+        entry = item.strip().upper()
+        if not entry:
+            continue
+        canonical, _, venue_pair = entry.partition(":")
+        canonical = canonical.strip()
+        if canonical:
+            pairs[canonical] = venue_pair.strip() or canonical
+    return pairs
+
+
+def watchlists_from(env: dict[str, str]) -> dict[str, dict[str, str]]:
+    """Which pairs to record on which venue, and what each venue calls them.
 
     WATCHLIST is binance, unchanged. Any other venue is turned on by giving it
-    its own list, e.g. WATCHLIST_COINBASE=SOLUSDC - a venue with no list is
-    simply not polled.
+    its own list, e.g. WATCHLIST_COINBASE=SOLUSDC:SOLUSD - a venue with no list
+    is simply not polled.
     """
-    watchlists: dict[str, list[str]] = {"binance": watchlist_from(env)}
+    watchlists: dict[str, dict[str, str]] = {
+        "binance": {pair: pair for pair in watchlist_from(env)}
+    }
     for key, value in env.items():
         if not key.startswith("WATCHLIST_"):
             continue
         name = key[len("WATCHLIST_") :].strip().lower()
-        pairs = watchlist_from({"WATCHLIST": value}) if value.strip() else []
+        pairs = parse_watchlist(value)
         if name and pairs:
             watchlists[name] = pairs
     return watchlists
