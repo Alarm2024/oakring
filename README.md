@@ -268,7 +268,16 @@ What counts as a problem:
 
 `python3 alert.py --dry-run` prints what it would send without sending or advancing its state. The same checks back `./check.sh` and `python3 health.py`, so what you see by hand is exactly what triggers an alert.
 
-A note on the bot token: it lives in `.env` at mode `600`, and a Telegram token travels inside the request URL. `alert.py` never logs a URL for that reason — a failed send reports the transport name and HTTP status only. There is a test asserting exactly that.
+A note on the bot token: it lives in `.env` at mode `600`, and a Telegram token travels inside the request URL. `alert.py` never logs a URL for that reason — a failed send reports the transport name, the HTTP status, and the API's own explanation from the response body, with any configured secret masked if a misconfigured endpoint echoes one back. There are tests asserting both halves.
+
+If Telegram returns **HTTP 400**, the body says why. Usually it is `chat not found`, meaning the chat id is wrong or you have not sent the bot a message yet — a bot cannot open a conversation with you. Message the bot once, then read your id:
+
+```bash
+TOKEN=$(sed -n 's/^ALERT_TELEGRAM_TOKEN=//p' ~/.config/oakring/.env)
+curl -s "https://api.telegram.org/bot$TOKEN/getUpdates" | head -c 600
+```
+
+The id is `result[].message.chat.id` — negative for a group. Transports are independent, so a broken Telegram never stops Discord from delivering.
 
 ## Scheduled reports
 

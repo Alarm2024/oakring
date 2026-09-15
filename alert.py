@@ -109,7 +109,34 @@ def transports(env: dict) -> list[tuple[str, str, dict]]:
     return configured
 
 
-def send(name: str, url: str, template: dict, message: str, timeout: int = 15) -> bool:
+def redact(text: str, secrets: tuple[str, ...]) -> str:
+    for secret in secrets:
+        if secret and len(secret) > 6:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _reason(exc: urllib.error.HTTPError, secrets: tuple[str, ...]) -> str:
+    """The API's own explanation, which is what makes a 400 actionable.
+
+    The body is the service's response, not our request, so it does not carry
+    the token - but redact anyway in case a misconfigured endpoint echoes it.
+    """
+    try:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+    except Exception:  # noqa: BLE001 - a missing body must not mask the real error
+        return ""
+    return f" - {redact(body[:300], secrets)}" if body else ""
+
+
+def send(
+    name: str,
+    url: str,
+    template: dict,
+    message: str,
+    timeout: int = 15,
+    secrets: tuple[str, ...] = (),
+) -> bool:
     """Post one message. Never logs the URL: it can carry a bot token."""
     payload = {key: (message if value is None else value) for key, value in template.items()}
     request = urllib.request.Request(
@@ -124,7 +151,7 @@ def send(name: str, url: str, template: dict, message: str, timeout: int = 15) -
         logging.info("%s notified", name)
         return True
     except urllib.error.HTTPError as exc:
-        logging.error("%s rejected the message: HTTP %s", name, exc.code)
+        logging.error("%s rejected the message: HTTP %s%s", name, exc.code, _reason(exc, secrets))
     except Exception as exc:  # noqa: BLE001 - never let a transport fault escape
         logging.error("%s could not be reached: %s", name, type(exc).__name__)
     return False
@@ -153,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     env = common.load_config()
     common.setup_logging(env.get("LOG_LEVEL", "INFO"))
     destinations = transports(env)
+    secrets = tuple(
+        env.get(key, "").strip()
+        for key in ("ALERT_TELEGRAM_TOKEN", "ALERT_DISCORD_WEBHOOK", "ALERT_WEBHOOK")
+    )
 
     if not destinations and not args.dry_run:
         print(
@@ -168,7 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print(message)
             return 0
-        return 0 if all([send(*destination, message) for destination in destinations]) else 1
+        results = [send(*destination, message, secrets=secrets) for destination in destinations]
+        return 0 if all(results) else 1
 
     db_path = Path(args.db) if args.db else common.db_path_from(env)
     try:
@@ -192,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[would send: {reason}]")
             print(message)
         else:
-            delivered = [send(*destination, message) for destination in destinations]
+            delivered = [send(*destination, message, secrets=secrets) for destination in destinations]
             if any(delivered):
                 state["last_sent"] = now
             else:
