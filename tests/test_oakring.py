@@ -486,6 +486,22 @@ class LatestSnapshotTests(TempConfigCase):
         conn.close()
         self.assertIn("no priced ticks", entry["status"])
 
+    def test_a_missing_column_explains_itself(self) -> None:
+        """A bare "-" gets read as "this pair is broken"; it never means that."""
+        self.seed()
+        conn = common.connect(self.db_path, read_only=True)
+        snapshot = analyze.latest_snapshot(conn, ["SOLUSDT", "BTCUSDT"])
+        conn.close()
+        rendered = analyze.render_latest(snapshot, stale_after=300)
+        self.assertIn("not recording that long yet", rendered)
+
+        # A pair with every horizon filled in needs no explanation.
+        complete = [{
+            "pair": "SOLUSDT", "mid": 102.0, "spread_bps": 1.0, "age_sec": 30,
+            "age_human": "30s", "change_1h_pct": 1.0, "change_24h_pct": 2.0, "change_7d_pct": 3.0,
+        }]
+        self.assertNotIn("not recording that long yet", analyze.render_latest(complete, stale_after=300))
+
     def test_stale_marker_and_cli(self) -> None:
         self.seed()
         rendered = analyze.render_latest(

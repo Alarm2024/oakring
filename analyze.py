@@ -198,6 +198,17 @@ def render_latest(snapshot: list[dict], stale_after: int) -> str:
             f"{entry['spread_bps']:>7.2f}bps {entry['age_human']:>8} "
             f"{changes[0]:>9} {changes[1]:>9} {changes[2]:>9}{stale}"
         )
+
+    # "-" reads as "this pair is broken" without saying what it means. It is
+    # only ever "this pair has not been recording that long yet".
+    if any(
+        entry.get(f"change_{label}_pct") is None
+        for entry in snapshot
+        for label in ("1h", "24h", "7d")
+        if "status" not in entry
+    ):
+        lines.append("")
+        lines.append("-  means not recording that long yet, not a problem. `age` is what to watch.")
     return "\n".join(lines)
 
 
