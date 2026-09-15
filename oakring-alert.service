@@ -1,0 +1,29 @@
+[Unit]
+Description=Oakring recording health alert
+Documentation=https://github.com/Alarm2024/oakring
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/oakring
+ExecStart=/usr/bin/python3 /home/ubuntu/oakring/alert.py
+# A failed check is information, not a unit failure: exit 1 means "the
+# recording has a problem", which the alert itself reports.
+SuccessExitStatus=0 1
+
+# Reads the database and posts to one webhook. Writes only the alert state.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/.config/oakring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallFilter=@system-service

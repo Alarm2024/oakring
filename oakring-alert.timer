@@ -1,0 +1,11 @@
+[Unit]
+Description=Check oakring's health every few minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Alerts fire on a change of state, so a check this often is not noisy.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
