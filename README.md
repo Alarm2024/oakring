@@ -231,6 +231,45 @@ BTC  2026-09-14T23:31:00Z
 
 The percentage is the useful number over time: a pair whose residual sits inside the spread all day is quoted coherently, while one that spends most of its time outside a very tight spread is mostly showing you measurement noise.
 
+## Alerts
+
+A recorder that dies quietly is the one real risk to a project like this: the history you wanted is simply missing, and you find out days later. `alert.py` watches for that and tells you.
+
+Configure a destination in `~/.config/oakring/.env` — Telegram, Discord, or any endpoint that accepts a JSON POST:
+
+```bash
+ALERT_TELEGRAM_TOKEN=123456:ABCdef...
+ALERT_TELEGRAM_CHAT_ID=987654321
+# or
+ALERT_DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
+# or anything that takes {"text": "..."}
+ALERT_WEBHOOK=https://example.test/hook
+```
+
+Prove it works, then install the timer:
+
+```bash
+python3 alert.py --test
+sudo cp /home/ubuntu/oakring/oakring-alert.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now oakring-alert.timer
+```
+
+It checks every five minutes but **only sends on a change of state** — broke, recovered, or a new problem appearing — so the channel stays worth reading. While a problem persists it repeats every `ALERT_REPEAT_HOURS` (default 6) rather than every five minutes. A healthy first run says nothing at all: announcing good health on install just teaches you to ignore it.
+
+What counts as a problem:
+
+| Check | Fires when |
+|-------|-----------|
+| Recorder stopped | No tick from any pair for longer than `--stale-after` (default 5m) |
+| One pair quiet | A pair stops while the others keep going — a delisted or renamed symbol |
+| Sustained failures | Over 50% of the last hour's ticks errored |
+| Disk filling | Under 512 MB free where the database lives |
+| Database gone | The file is missing, or holds no ticks |
+
+`python3 alert.py --dry-run` prints what it would send without sending or advancing its state. The same checks back `./check.sh` and `python3 health.py`, so what you see by hand is exactly what triggers an alert.
+
+A note on the bot token: it lives in `.env` at mode `600`, and a Telegram token travels inside the request URL. `alert.py` never logs a URL for that reason — a failed send reports the transport name and HTTP status only. There is a test asserting exactly that.
+
 ## Scheduled reports
 
 `report.sh` writes a timestamped report into `~/.config/oakring/reports/` and prints the path. Any argument is passed through to `analyze.py`:
@@ -350,6 +389,8 @@ python3 -m unittest discover -s tests -v
 | `recorder.py` | Poll loop: batched fetch, retries, error rows, pruning, clean shutdown |
 | `report.sh` | Writes a timestamped report; what the timer runs |
 | `check.sh` | Health check: services, freshness, errors, prices |
+| `health.py` | The checks themselves, shared by check.sh and alert.py |
+| `alert.py` | Notifies Telegram/Discord/webhook when recording breaks |
 | `analyze.py` | Cycle report: bars, coverage, trend, swings, periodogram, phase |
 | `common.py` | Shared config, database open/migrate, time helpers |
 | `schema.sql` | `ticks` table and indexes |
@@ -357,3 +398,4 @@ python3 -m unittest discover -s tests -v
 | `.env.example` | Sample configuration (copy to `~/.config/oakring/.env`) |
 | `oakring.service` | Hardened systemd unit template |
 | `oakring-report.{service,timer}` | Scheduled weekly report |
+| `oakring-alert.{service,timer}` | Health check every five minutes |
