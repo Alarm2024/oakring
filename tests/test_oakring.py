@@ -199,7 +199,7 @@ class RecorderLoopTests(TempConfigCase):
             conn = common.connect(self.db_path)
             venues.VENUES["binance"] = dataclasses.replace(
                 venues.VENUES["binance"], base_url="https://example.test")
-            recorder.run_tick(conn, {"binance": ["SOLUSDT", "BTCUSDT"]}, 5, 0)
+            recorder.run_tick(conn, {"binance": {"SOLUSDT": "SOLUSDT", "BTCUSDT": "BTCUSDT"}}, 5, 0)
         finally:
             recorder.http_get_json = original
 
@@ -218,7 +218,7 @@ class RecorderLoopTests(TempConfigCase):
             conn = common.connect(self.db_path)
             venues.VENUES["binance"] = dataclasses.replace(
                 venues.VENUES["binance"], base_url="https://example.test")
-            recorder.run_tick(conn, {"binance": ["SOLUSDT"]}, 1, 0)
+            recorder.run_tick(conn, {"binance": {"SOLUSDT": "SOLUSDT"}}, 1, 0)
         finally:
             recorder.http_get_json = original
 
@@ -319,17 +319,17 @@ class LocalServerTests(TempConfigCase):
 
     def test_single_pair_uses_symbol_and_batch_uses_symbols(self) -> None:
         venue = venues.VENUES["binance"]
-        one = recorder.fetch_venue(venue, ["SOLUSDT"], 5)
+        one = recorder.fetch_venue(venue, {"SOLUSDT": "SOLUSDT"}, 5)
         self.assertAlmostEqual(one["SOLUSDT"].bid, 100.0)
         self.assertIn("symbol=SOLUSDT", self.requests[-1])
 
-        many = recorder.fetch_venue(venue, ["SOLUSDT", "BTCUSDT"], 5)
+        many = recorder.fetch_venue(venue, {"SOLUSDT": "SOLUSDT", "BTCUSDT": "BTCUSDT"}, 5)
         self.assertEqual(sorted(many), ["BTCUSDT", "SOLUSDT"])
         self.assertIn("symbols=", self.requests[-1])
 
     def test_unknown_symbol_falls_back_so_good_pairs_still_record(self) -> None:
         conn = common.connect(self.db_path)
-        recorder.run_tick(conn, {"binance": ["SOLUSDT", "NOPEUSDT"]}, 5, 0)
+        recorder.run_tick(conn, {"binance": {"SOLUSDT": "SOLUSDT", "NOPEUSDT": "NOPEUSDT"}}, 5, 0)
         rows = {row["pair"]: row for row in conn.execute("SELECT pair, mid, note FROM ticks")}
         self.assertAlmostEqual(rows["SOLUSDT"]["mid"], 100.05)
         self.assertIsNone(rows["SOLUSDT"]["note"])
@@ -339,7 +339,7 @@ class LocalServerTests(TempConfigCase):
     def test_end_to_end_tick_then_report(self) -> None:
         conn = common.connect(self.db_path)
         for _ in range(3):
-            recorder.run_tick(conn, {"binance": ["SOLUSDT"]}, 5, 0)
+            recorder.run_tick(conn, {"binance": {"SOLUSDT": "SOLUSDT"}}, 5, 0)
         conn.close()
 
         buffer = io.StringIO()

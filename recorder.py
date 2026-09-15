@@ -49,30 +49,33 @@ def http_get_json(url: str, timeout: int) -> object:
         return json.loads(response.read().decode())
 
 
-def fetch_venue(venue: venues.Venue, pairs: list[str], timeout: int) -> dict[str, venues.Quote]:
+def fetch_venue(venue: venues.Venue, pairs: dict[str, str], timeout: int) -> dict[str, venues.Quote]:
     """Top of book for these pairs on one venue, keyed by canonical pair.
 
-    Batched venues take the whole list in one request; the rest are asked one
-    pair at a time, so a single bad symbol costs only that symbol.
+    `pairs` maps the name we store under to the name this venue uses, so a
+    market called SOL-USD on one exchange still lands beside SOLUSDC from
+    another. Batched venues take the whole list in one request; the rest are
+    asked one at a time, so a single bad symbol costs only that symbol.
     """
     quotes: dict[str, venues.Quote] = {}
-    groups = [pairs] if venue.batched else [[pair] for pair in pairs]
+    canonical_names = list(pairs)
+    groups = [canonical_names] if venue.batched else [[name] for name in canonical_names]
 
     for group in groups:
         if _shutdown.is_set():
             break
-        symbols = [venue.to_symbol(pair) for pair in group]
+        symbols = [venue.to_symbol(pairs[name]) for name in group]
         payload = http_get_json(venue.build_url(venue.base_url, symbols), timeout)
         parsed = venue.parse(payload, symbols[0])
-        for pair, symbol in zip(group, symbols):
-            quote = parsed.get(symbol) or parsed.get(pair.upper())
+        for name, symbol in zip(group, symbols):
+            quote = parsed.get(symbol) or parsed.get(pairs[name].upper())
             if quote is not None:
-                quotes[pair] = quote
+                quotes[name] = quote
     return quotes
 
 
 def fetch_with_retries(
-    venue: venues.Venue, pairs: list[str], timeout: int, max_retries: int
+    venue: venues.Venue, pairs: dict[str, str], timeout: int, max_retries: int
 ) -> tuple[dict[str, venues.Quote], str | None]:
     """Fetch, retried with exponential backoff, then one pair at a time."""
     last_error: Exception | None = None
@@ -95,13 +98,13 @@ def fetch_with_retries(
         "%s batch failed (%s), falling back to per-pair", venue.name, _describe(last_error)
     )
     results: dict[str, venues.Quote] = {}
-    for pair in pairs:
+    for name, symbol in pairs.items():
         if _shutdown.is_set():
             break
         try:
-            results.update(fetch_venue(venue, [pair], timeout))
+            results.update(fetch_venue(venue, {name: symbol}, timeout))
         except Exception as exc:  # noqa: BLE001
-            logging.warning("%s %s failed: %s", venue.name, pair, _describe(exc))
+            logging.warning("%s %s failed: %s", venue.name, name, _describe(exc))
     return results, None if results else _describe(last_error)
 
 
@@ -151,7 +154,7 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
 
 def run_tick(
     conn: sqlite3.Connection,
-    watchlists: dict[str, list[str]],
+    watchlists: dict[str, dict[str, str]],
     timeout: int,
     max_retries: int,
 ) -> None:
@@ -204,7 +207,7 @@ def next_tick_at(now: float, interval_sec: int) -> float:
     return (int(now // interval_sec) + 1) * interval_sec
 
 
-def probe(pairs: list[str], timeout: int) -> int:
+def probe(pairs: dict[str, str], timeout: int) -> int:
     """Ask every known venue for these pairs once, and report what came back.
 
     This is the check that the parsers still match the live APIs - nothing
@@ -214,20 +217,23 @@ def probe(pairs: list[str], timeout: int) -> int:
     failures = 0
     for name in sorted(venues.VENUES):
         venue = venues.get(name)
-        for pair in pairs:
+        for pair, symbol in pairs.items():
             try:
-                quote = fetch_venue(venue, [pair], timeout).get(pair)
+                quote = fetch_venue(venue, {pair: symbol}, timeout).get(pair)
                 if quote is None:
                     raise venues.VenueError("no quote in the response")
                 mid, spread = compute_mid_spread(quote.bid, quote.ask)
                 print(
-                    f"{name:<10} {pair:<10} ok   bid={quote.bid:<12g} ask={quote.ask:<12g} "
-                    f"mid={mid:<12g} spread={spread:.2f}bps"
+                    f"{name:<10} {venue.to_symbol(symbol):<10} ok   bid={quote.bid:<12g} "
+                    f"ask={quote.ask:<12g} mid={mid:<12g} spread={spread:.2f}bps"
                 )
             except Exception as exc:  # noqa: BLE001 - report, never raise
                 failures += 1
                 detail = getattr(exc, "reason", None) or exc
-                print(f"{name:<10} {pair:<10} FAILED  {_describe(exc)}: {str(detail)[:80]}")
+                print(
+                    f"{name:<10} {venue.to_symbol(symbol):<10} FAILED  "
+                    f"{_describe(exc)}: {str(detail)[:80]}"
+                )
     if failures:
         print(f"\n{failures} venue/pair combinations failed - only add the ones that say ok.")
     return 1 if failures else 0
@@ -239,7 +245,8 @@ def main() -> None:
         "--probe",
         nargs="*",
         metavar="PAIR",
-        help="ask every venue for these pairs once, print the result, and exit "
+        help="ask every venue for these pairs once, print the result, and exit. "
+             "PAIR:VENUE_PAIR tries a different name, e.g. SOLUSDC:SOLUSD "
              "(default: SOLUSDC)",
     )
     args = parser.parse_args()
@@ -250,7 +257,7 @@ def main() -> None:
     if args.probe is not None:
         common.setup_logging(env.get("LOG_LEVEL", "WARNING"))
         timeout = common.env_int(env, "HTTP_TIMEOUT_SEC", 15, minimum=1)
-        raise SystemExit(probe([pair.upper() for pair in args.probe] or ["SOLUSDC"], timeout))
+        raise SystemExit(probe(common.parse_watchlist(",".join(args.probe) or "SOLUSDC"), timeout))
 
     watchlists = common.watchlists_from(env)
     interval_sec = common.env_int(env, "INTERVAL_SEC", 60, minimum=1)
@@ -268,7 +275,10 @@ def main() -> None:
     conn = common.connect(db_path)
 
     for name, pairs in watchlists.items():
-        logging.info("recording %s on %s", ",".join(pairs), name)
+        listed = ", ".join(
+            pair if pair == symbol else f"{pair} (as {symbol})" for pair, symbol in pairs.items()
+        )
+        logging.info("recording %s on %s", listed, name)
     logging.info(
         "every %ds into %s (retention=%s)",
         interval_sec,
