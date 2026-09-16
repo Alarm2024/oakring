@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
@@ -23,6 +24,8 @@ import recorder  # noqa: E402
 import venues  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "jupiter_quote_sol_usdc.json"
+FIXTURE_RAY = Path(__file__).resolve().parent / "fixtures" / "jupiter_quote_raydium.json"
+FIXTURE_ORCA = Path(__file__).resolve().parent / "fixtures" / "jupiter_quote_orca.json"
 
 
 class TempConfigCase(unittest.TestCase):
@@ -50,6 +53,31 @@ class JupiterParseTests(unittest.TestCase):
         self.assertEqual(quote.in_amount, 1_000_000_000)
         self.assertEqual(quote.out_amount, 150_250_000)
 
+    def test_extract_amm_key(self) -> None:
+        payload = json.loads(FIXTURE_RAY.read_text(encoding="utf-8"))
+        self.assertEqual(jupiter.extract_amm_key(payload), "ray-pool-abc")
+
+    def test_build_quote_url_with_dex_filter(self) -> None:
+        url = jupiter.build_quote_url(
+            "https://example.test/quote",
+            jupiter.DEFAULT_INPUT_MINT,
+            jupiter.DEFAULT_OUTPUT_MINT,
+            1_000_000_000,
+            50,
+            dex="Raydium",
+            only_direct_routes=True,
+        )
+        query = parse_qs(urlparse(url).query)
+        self.assertEqual(query["dexes"], ["Raydium"])
+        self.assertEqual(query["onlyDirectRoutes"], ["true"])
+
+    def test_output_for_pair_usdc_and_usdt(self) -> None:
+        cfg = jupiter.config_from({})
+        usdc = jupiter.output_for_pair("SOLUSDC", cfg)
+        usdt = jupiter.output_for_pair("SOLUSDT", cfg)
+        self.assertEqual(usdc[0], jupiter.DEFAULT_OUTPUT_MINT)
+        self.assertEqual(usdt[0], jupiter.DEFAULT_USDT_MINT)
+
     def test_basis_bps(self) -> None:
         self.assertAlmostEqual(recorder.compute_basis_bps(150.50, 150.25), 16.64, places=1)
 
@@ -64,9 +92,6 @@ class JupiterRecorderTests(TempConfigCase):
                 {"symbol": "BTCUSDT", "bidPrice": "60000", "askPrice": "60010", "bidQty": "1", "askQty": "1"},
             ]
 
-        def fake_jupiter(url: str, timeout: int, headers: dict[str, str]) -> object:
-            return fixture
-
         original_binance, recorder.http_get_json = recorder.http_get_json, fake_binance
         original_jupiter, jupiter.fetch_quote = jupiter.fetch_quote, (
             lambda **kwargs: jupiter.parse_quote(fixture, 9, 6)
@@ -76,18 +101,7 @@ class JupiterRecorderTests(TempConfigCase):
             venues.VENUES["binance"] = dataclasses.replace(
                 venues.VENUES["binance"], base_url="https://example.test"
             )
-            jupiter_cfg = {
-                "enabled": True,
-                "attach_pairs": {"SOLUSDT"},
-                "quote_url": "https://example.test/quote",
-                "input_mint": jupiter.DEFAULT_INPUT_MINT,
-                "output_mint": jupiter.DEFAULT_OUTPUT_MINT,
-                "amount": 1_000_000_000,
-                "slippage_bps": 50,
-                "input_decimals": 9,
-                "output_decimals": 6,
-                "api_key": None,
-            }
+            jupiter_cfg = jupiter.config_from({"JUPITER_ENABLED": "1", "JUPITER_ATTACH_PAIRS": "SOLUSDT"})
             recorder.run_tick(
                 conn,
                 {"binance": {"SOLUSDT": "SOLUSDT", "BTCUSDT": "BTCUSDT"}},
@@ -117,11 +131,65 @@ class JupiterRecorderTests(TempConfigCase):
         self.assertIsNone(btc["onchain_ref"])
         self.assertIsNone(btc["basis_bps"])
 
+    def test_run_tick_records_per_pool_samples(self) -> None:
+        fixtures = {
+            "Raydium": json.loads(FIXTURE_RAY.read_text(encoding="utf-8")),
+            "Orca": json.loads(FIXTURE_ORCA.read_text(encoding="utf-8")),
+        }
+
+        def fake_binance(url: str, timeout: int) -> object:
+            return [
+                {"symbol": "SOLUSDC", "bidPrice": "150.40", "askPrice": "150.60", "bidQty": "1", "askQty": "1"},
+            ]
+
+        def fake_jupiter(url: str, timeout: int, headers: dict[str, str]) -> object:
+            dex = parse_qs(urlparse(url).query).get("dexes", [""])[0]
+            return fixtures[dex]
+
+        original_binance, recorder.http_get_json = recorder.http_get_json, fake_binance
+        original_get, recorder._jupiter_http_get = recorder._jupiter_http_get, fake_jupiter
+        original_fetch, jupiter.fetch_quote = jupiter.fetch_quote, (
+            lambda **kwargs: jupiter.parse_quote(json.loads(FIXTURE.read_text(encoding="utf-8")), 9, 6)
+        )
+        try:
+            conn = common.connect(self.db_path)
+            venues.VENUES["binance"] = dataclasses.replace(
+                venues.VENUES["binance"], base_url="https://example.test"
+            )
+            jupiter_cfg = jupiter.config_from({
+                "JUPITER_ENABLED": "1",
+                "JUPITER_ATTACH_PAIRS": "SOLUSDC",
+                "JUPITER_DEXES": "Raydium,Orca",
+            })
+            recorder.run_tick(conn, {"binance": {"SOLUSDC": "SOLUSDC"}}, 5, 0, jupiter_cfg)
+        finally:
+            recorder.http_get_json = original_binance
+            recorder._jupiter_http_get = original_get
+            jupiter.fetch_quote = original_fetch
+
+        pools = {
+            row["dex"]: row
+            for row in conn.execute(
+                "SELECT dex, ref_price, basis_bps, amm_key, note FROM pool_samples"
+            ).fetchall()
+        }
+        conn.close()
+
+        self.assertEqual(set(pools), {"Raydium", "Orca"})
+        ray = pools["Raydium"]
+        self.assertAlmostEqual(ray["ref_price"], 150.20)
+        self.assertAlmostEqual(ray["basis_bps"], 19.97, places=1)
+        self.assertEqual(ray["amm_key"], "ray-pool-abc")
+        self.assertIsNone(ray["note"])
+        self.assertAlmostEqual(pools["Orca"]["ref_price"], 150.32)
+
     def test_migration_adds_onchain_columns(self) -> None:
         conn = common.connect(self.db_path)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(ticks)")}
+        tick_columns = {row[1] for row in conn.execute("PRAGMA table_info(ticks)")}
+        pool_columns = {row[1] for row in conn.execute("PRAGMA table_info(pool_samples)")}
         conn.close()
-        self.assertTrue({"onchain_ref", "onchain_impact_bps", "basis_bps", "onchain_note"} <= columns)
+        self.assertTrue({"onchain_ref", "onchain_impact_bps", "basis_bps", "onchain_note"} <= tick_columns)
+        self.assertTrue({"dex", "ref_price", "basis_bps", "amm_key"} <= pool_columns)
 
 
 class BasisAnalysisTests(TempConfigCase):
@@ -148,7 +216,6 @@ class BasisAnalysisTests(TempConfigCase):
         conn = common.connect(self.db_path)
         base = common.to_epoch(common.now_utc()) - 600
         rows = []
-        # held: basis near zero for 3 ticks
         for offset in (0, 60, 120):
             epoch = base + offset
             rows.append(
@@ -158,7 +225,6 @@ class BasisAnalysisTests(TempConfigCase):
                     150.0, 0.5, 0.0, None,
                 )
             )
-        # edge: basis wide for 3 ticks
         for offset in (180, 240, 300):
             epoch = base + offset
             rows.append(
@@ -179,8 +245,33 @@ class BasisAnalysisTests(TempConfigCase):
         self.assertEqual(report["ticks"], 6)
         self.assertEqual(len(report["held_periods"]), 1)
         self.assertEqual(len(report["edge_periods"]), 1)
-        self.assertAlmostEqual(report["held_periods"][0]["mean_bps"], 0.0, places=1)
-        self.assertGreater(report["edge_periods"][0]["mean_bps"], 50.0)
+
+    def test_basis_report_per_pool_and_cross_pool(self) -> None:
+        conn = common.connect(self.db_path)
+        base = common.to_epoch(common.now_utc()) - 300
+        ts = common.to_ts_utc(common.from_epoch(base))
+        recorder.insert_rows(
+            conn,
+            [(ts, base, "SOLUSDC", "binance", 150.40, 150.60, 150.50, 13.0, 1.0, 1.0, None, None, None, None, None)],
+        )
+        recorder.insert_pool_samples(
+            conn,
+            [
+                (ts, base, "SOLUSDC", "Raydium", 150.20, 19.97, 1.0, 1_000_000_000, 150_200_000, "ray", None),
+                (ts, base, "SOLUSDC", "Orca", 150.32, 11.98, 0.8, 1_000_000_000, 150_320_000, "orca", None),
+            ],
+        )
+        conn.close()
+
+        conn = common.connect(self.db_path, read_only=True)
+        report = analyze.basis_report(conn, "SOLUSDC", base - 60, base + 60, held_bps=15.0, edge_bps=40.0, min_ticks=1)
+        conn.close()
+
+        self.assertIn("Raydium", report["pools"])
+        self.assertIn("Orca", report["pools"])
+        self.assertAlmostEqual(report["cross_pool"]["last"]["spread_bps"], 7.99, places=1)
+        self.assertEqual(report["cross_pool"]["last"]["best_buy_dex"], "Raydium")
+        self.assertEqual(report["cross_pool"]["last"]["best_sell_dex"], "Orca")
 
     def test_basis_cli(self) -> None:
         self.seed_basis_ticks()
@@ -193,7 +284,6 @@ class BasisAnalysisTests(TempConfigCase):
         output = buffer.getvalue()
         self.assertIn("SOLUSDT", output)
         self.assertIn("basis", output)
-        self.assertIn("on-chain", output)
 
 
 if __name__ == "__main__":

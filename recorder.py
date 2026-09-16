@@ -187,6 +187,74 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
     conn.commit()
 
 
+def pool_sample_rows(
+    ts: str,
+    epoch: int,
+    pair: str,
+    cex_mid: float | None,
+    samples: list[jupiter.PoolSample],
+) -> list[tuple]:
+    rows: list[tuple] = []
+    for sample in samples:
+        basis_bps = compute_basis_bps(cex_mid, sample.ref_price)
+        rows.append(
+            (
+                ts,
+                epoch,
+                pair,
+                sample.dex,
+                sample.ref_price,
+                basis_bps,
+                sample.impact_bps,
+                sample.in_amount,
+                sample.out_amount,
+                sample.amm_key,
+                sample.note,
+            )
+        )
+    return rows
+
+
+def insert_pool_samples(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO pool_samples
+            (ts_utc, ts_epoch, pair, dex, ref_price, basis_bps, impact_bps,
+             in_amount, out_amount, amm_key, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def record_pool_samples(
+    conn: sqlite3.Connection,
+    ts: str,
+    epoch: int,
+    cex_mids: dict[str, float],
+    jupiter_cfg: dict[str, object],
+    timeout: int,
+) -> list[tuple]:
+    """Fetch per-DEX quotes for attached pairs and write pool_samples rows."""
+    dexes = jupiter_cfg.get("dexes") or []
+    attach_pairs = jupiter_cfg.get("attach_pairs") or set()
+    if not dexes or not attach_pairs:
+        return []
+
+    pool_rows: list[tuple] = []
+    for pair in sorted(attach_pairs):
+        cex_mid = cex_mids.get(pair)
+        samples = jupiter.fetch_pool_samples_for_pair(
+            pair, jupiter_cfg, timeout, http_get=_jupiter_http_get
+        )
+        pool_rows.extend(pool_sample_rows(ts, epoch, pair, cex_mid, samples))
+    insert_pool_samples(conn, pool_rows)
+    return pool_rows
+
+
 def fetch_jupiter_quote(
     jupiter_cfg: dict[str, object],
     timeout: int,
@@ -265,6 +333,13 @@ def run_tick(
 
     insert_rows(conn, rows)
 
+    cex_mids = {
+        row[2]: row[6]
+        for row in rows
+        if row[2] in attach_pairs and row[10] is None and row[6] is not None
+    }
+    pool_rows = record_pool_samples(conn, ts, epoch, cex_mids, jupiter_cfg, timeout)
+
     multi = len(watchlists) > 1
     for row in rows:
         pair, source, bid, ask, mid, spread_bps, note = row[2], row[3], row[4], row[5], row[6], row[7], row[10]
@@ -282,17 +357,38 @@ def run_tick(
         if onchain_note and pair in attach_pairs:
             logging.warning("%s onchain %s", label, onchain_note)
 
+    pools_by_pair: dict[str, list[tuple]] = {}
+    for row in pool_rows:
+        pools_by_pair.setdefault(row[2], []).append(row)
+    for pair, samples in pools_by_pair.items():
+        label = pair if not multi else f"binance {pair}"
+        priced = [sample for sample in samples if sample[4] is not None and sample[10] is None]
+        if not priced:
+            continue
+        parts = []
+        for sample in priced:
+            dex, ref, basis = sample[3], sample[4], sample[5]
+            parts.append(f"{dex}={ref:.4f}({basis:+.1f}bps)" if basis is not None else f"{dex}={ref:.4f}")
+        logging.info("%s pools: %s", label, "  ".join(parts))
+
 
 def prune(conn: sqlite3.Connection, retention_days: int) -> int:
     """Drop ticks older than the retention window. 0 keeps everything."""
     if retention_days <= 0:
         return 0
     cutoff = common.to_epoch(common.now_utc() - timedelta(days=retention_days))
-    cursor = conn.execute("DELETE FROM ticks WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
+    tick_cursor = conn.execute("DELETE FROM ticks WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
+    pool_cursor = conn.execute("DELETE FROM pool_samples WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
     conn.commit()
-    if cursor.rowcount > 0:
-        logging.info("pruned %d ticks older than %d days", cursor.rowcount, retention_days)
-    return cursor.rowcount
+    removed = tick_cursor.rowcount + pool_cursor.rowcount
+    if removed > 0:
+        logging.info(
+            "pruned %d ticks and %d pool samples older than %d days",
+            tick_cursor.rowcount,
+            pool_cursor.rowcount,
+            retention_days,
+        )
+    return removed
 
 
 def next_tick_at(now: float, interval_sec: int) -> float:
@@ -387,6 +483,9 @@ def main() -> None:
             jupiter_cfg["input_mint"],
             jupiter_cfg["output_mint"],
         )
+        dexes = jupiter_cfg.get("dexes") or []
+        if dexes:
+            logging.info("jupiter per-pool samples: %s", ", ".join(dexes))  # type: ignore[arg-type]
 
     last_prune = 0.0
     try:
