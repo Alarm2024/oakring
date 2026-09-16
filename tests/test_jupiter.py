@@ -49,7 +49,7 @@ class JupiterParseTests(unittest.TestCase):
         payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
         quote = jupiter.parse_quote(payload, input_decimals=9, output_decimals=6)
         self.assertAlmostEqual(quote.ref_price, 150.25)
-        self.assertAlmostEqual(quote.impact_bps, 1.25)
+        self.assertAlmostEqual(quote.impact_bps, 125.0)
         self.assertEqual(quote.in_amount, 1_000_000_000)
         self.assertEqual(quote.out_amount, 150_250_000)
 

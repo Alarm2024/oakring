@@ -180,8 +180,8 @@ def parse_quote(
     impact_raw = payload.get("priceImpactPct")
     impact_bps = None
     if impact_raw is not None:
-        # Jupiter reports percent as a string like "0.0123" (= 0.0123%).
-        impact_bps = _number(impact_raw, "priceImpactPct") * 100.0
+        # Jupiter priceImpactPct is a fraction (e.g. 0.0123 = 1.23%), not a percent.
+        impact_bps = _number(impact_raw, "priceImpactPct") * 10000.0
     ref_price = ref_price_from_amounts(in_amount, out_amount, input_decimals, output_decimals)
     return JupiterQuote(
         ref_price,

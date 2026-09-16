@@ -323,7 +323,7 @@ The percentage is the useful number over time: a pair whose residual sits inside
 
 ## CEX vs on-chain basis (Jupiter)
 
-Optional dry measurement: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter public quotes on each tick and stores them next to the CEX book on the configured pairs (`JUPITER_ATTACH_PAIRS`, default `SOLUSDT,SOLUSDC`). Both legs share the same timestamp, so basis is available at tick resolution — e.g. ~1s if `INTERVAL_SEC=1`, instead of the ~30s journal samples elsewhere.
+Optional dry measurement: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter public quotes on each tick and stores them next to the CEX book on the configured pairs (`JUPITER_ATTACH_PAIRS`, default `SOLUSDT,SOLUSDC`). Both legs share the same timestamp, so basis is available at tick resolution — typically one sample per `INTERVAL_SEC` tick when quotes succeed (sequential DEX fetches and retries can push the effective cadence above `INTERVAL_SEC`; failed ticks are skipped gracefully), instead of the ~30s journal samples elsewhere. CEX mids used for per-pool basis are keyed by pair name only (Binance-only today).
 
 Two layers are recorded:
 
