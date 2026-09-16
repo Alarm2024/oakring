@@ -6,6 +6,7 @@ Stdlib only. Safe to run while the recorder is writing (opens read-only).
     python3 analyze.py --since 7d --bucket 1h
     python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
     python3 analyze.py --format json --since 24h --bucket 15m > report.json
+    python3 analyze.py --basis --since 12h --held-bps 15 --edge-bps 40
 
 What it reports per pair:
   * coverage    - how much of the window was actually recorded, and the gaps
@@ -1045,6 +1046,360 @@ def render_csv(pair: str, bars: list[Bar]) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- basis (CEX vs on-chain)
+
+
+def basis_keys(conn, wanted: list[str] | None = None, venue: str | None = None) -> list[tuple[str, str]]:
+    """Pairs with aggregated on-chain ref and/or per-pool samples recorded."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT pair, source
+        FROM ticks
+        WHERE onchain_ref IS NOT NULL OR onchain_note IS NOT NULL
+        UNION
+        SELECT DISTINCT pair, 'binance' AS source
+        FROM pool_samples
+        ORDER BY pair, source
+        """
+    ).fetchall()
+    keys = [(row["pair"], row["source"]) for row in rows]
+    if wanted:
+        names = {name.upper() for name in wanted}
+        keys = [key for key in keys if key[0].upper() in names]
+    if venue:
+        keys = [key for key in keys if key[1].lower() == venue.lower()]
+    return keys
+
+
+def basis_series(conn, pair: str, start: int, end: int, source: str = "binance") -> list[dict]:
+    """Per-tick CEX mid vs Jupiter reference, both legs from the same timestamp."""
+    rows = conn.execute(
+        f"""
+        SELECT {EPOCH_SQL} AS epoch, mid, onchain_ref, basis_bps, onchain_impact_bps, onchain_note
+        FROM ticks
+        WHERE pair = ? AND source = ? AND {EPOCH_SQL} BETWEEN ? AND ?
+        ORDER BY epoch
+        """,
+        (pair, source, start, end),
+    ).fetchall()
+
+    series: list[dict] = []
+    for row in rows:
+        if row["mid"] is None:
+            continue
+        mid = float(row["mid"])
+        onchain_ref = row["onchain_ref"]
+        basis_bps = row["basis_bps"]
+        if basis_bps is None and onchain_ref is not None and float(onchain_ref) > 0:
+            basis_bps = (mid - float(onchain_ref)) / float(onchain_ref) * 10000.0
+        if basis_bps is None:
+            continue
+        series.append(
+            {
+                "epoch": int(row["epoch"]),
+                "mid": mid,
+                "onchain_ref": float(onchain_ref) if onchain_ref is not None else None,
+                "basis_bps": float(basis_bps),
+                "impact_bps": float(row["onchain_impact_bps"]) if row["onchain_impact_bps"] is not None else None,
+                "onchain_note": row["onchain_note"],
+            }
+        )
+    return series
+
+
+def pool_dexes(conn, pair: str, start: int, end: int) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT dex
+        FROM pool_samples
+        WHERE pair = ? AND ts_epoch BETWEEN ? AND ?
+        ORDER BY dex
+        """,
+        (pair, start, end),
+    ).fetchall()
+    return [row["dex"] for row in rows]
+
+
+def pool_basis_series(conn, pair: str, dex: str, start: int, end: int) -> list[dict]:
+    """Per-tick basis for one DEX pool sample aligned to the CEX tick."""
+    rows = conn.execute(
+        """
+        SELECT ps.ts_epoch AS epoch, ps.ref_price AS onchain_ref, ps.basis_bps,
+               ps.impact_bps, ps.note AS onchain_note, t.mid
+        FROM pool_samples ps
+        LEFT JOIN ticks t
+          ON t.pair = ps.pair AND t.ts_epoch = ps.ts_epoch AND t.source = 'binance'
+        WHERE ps.pair = ? AND ps.dex = ? AND ps.ts_epoch BETWEEN ? AND ?
+        ORDER BY ps.ts_epoch
+        """,
+        (pair, dex, start, end),
+    ).fetchall()
+
+    series: list[dict] = []
+    for row in rows:
+        if row["onchain_note"] is not None or row["onchain_ref"] is None:
+            continue
+        mid = float(row["mid"]) if row["mid"] is not None else None
+        basis_bps = row["basis_bps"]
+        onchain_ref = float(row["onchain_ref"])
+        if basis_bps is None and mid is not None and onchain_ref > 0:
+            basis_bps = (mid - onchain_ref) / onchain_ref * 10000.0
+        if basis_bps is None:
+            continue
+        series.append(
+            {
+                "epoch": int(row["epoch"]),
+                "mid": mid,
+                "onchain_ref": onchain_ref,
+                "basis_bps": float(basis_bps),
+                "impact_bps": float(row["impact_bps"]) if row["impact_bps"] is not None else None,
+                "onchain_note": None,
+                "dex": dex,
+            }
+        )
+    return series
+
+
+def cross_pool_series(conn, pair: str, start: int, end: int) -> list[dict]:
+    """Per-tick spread between cheapest and dearest pool (same quote mint)."""
+    rows = conn.execute(
+        """
+        SELECT ts_epoch AS epoch, dex, ref_price
+        FROM pool_samples
+        WHERE pair = ? AND ts_epoch BETWEEN ? AND ? AND note IS NULL AND ref_price IS NOT NULL
+        ORDER BY ts_epoch, dex
+        """,
+        (pair, start, end),
+    ).fetchall()
+
+    by_epoch: dict[int, list[tuple[str, float]]] = {}
+    for row in rows:
+        by_epoch.setdefault(int(row["epoch"]), []).append((row["dex"], float(row["ref_price"])))
+
+    series: list[dict] = []
+    for epoch in sorted(by_epoch):
+        pools = by_epoch[epoch]
+        if len(pools) < 2:
+            continue
+        best_buy = min(pools, key=lambda item: item[1])
+        best_sell = max(pools, key=lambda item: item[1])
+        if best_buy[1] <= 0:
+            continue
+        spread_bps = (best_sell[1] - best_buy[1]) / best_buy[1] * 10000.0
+        series.append(
+            {
+                "epoch": epoch,
+                "spread_bps": spread_bps,
+                "best_buy_dex": best_buy[0],
+                "best_buy_ref": best_buy[1],
+                "best_sell_dex": best_sell[0],
+                "best_sell_ref": best_sell[1],
+                "pool_count": len(pools),
+            }
+        )
+    return series
+
+
+def _summarize_basis_series(
+    series: list[dict],
+    *,
+    held_bps: float,
+    edge_bps: float,
+    min_ticks: int,
+) -> dict:
+    values = [point["basis_bps"] for point in series]
+    last = series[-1]
+    span = series[-1]["epoch"] - series[0]["epoch"]
+    held = _basis_runs(series, kind="held", threshold_bps=held_bps, min_ticks=min_ticks)
+    edge = _basis_runs(series, kind="edge", threshold_bps=edge_bps, min_ticks=min_ticks)
+    return {
+        "ticks": len(series),
+        "span_sec": span,
+        "span_human": common.format_duration(span),
+        "last": {
+            "epoch": last["epoch"],
+            "mid": last.get("mid"),
+            "onchain_ref": last["onchain_ref"],
+            "basis_bps": round(last["basis_bps"], 2),
+            "impact_bps": last.get("impact_bps"),
+            "dex": last.get("dex"),
+        },
+        "stats": {
+            "mean_bps": round(statistics.fmean(values), 2),
+            "stdev_bps": round(statistics.pstdev(values), 2) if len(values) > 1 else 0.0,
+            "min_bps": round(min(values), 2),
+            "max_bps": round(max(values), 2),
+        },
+        "held_periods": held,
+        "edge_periods": edge,
+        "held_ticks_pct": round(100.0 * sum(run["ticks"] for run in held) / len(series), 1),
+        "edge_ticks_pct": round(100.0 * sum(run["ticks"] for run in edge) / len(series), 1),
+    }
+
+
+def _basis_runs(
+    series: list[dict],
+    *,
+    kind: str,
+    threshold_bps: float,
+    min_ticks: int,
+) -> list[dict]:
+    """Find consecutive runs where |basis| is inside (held) or outside (edge) a band."""
+    runs: list[dict] = []
+    run_start: int | None = None
+    run_values: list[float] = []
+
+    def flush(end_index: int) -> None:
+        nonlocal run_start, run_values
+        if run_start is None or len(run_values) < min_ticks:
+            run_start, run_values = None, []
+            return
+        start_epoch = series[run_start]["epoch"]
+        end_epoch = series[end_index]["epoch"]
+        runs.append(
+            {
+                "kind": kind,
+                "start_epoch": start_epoch,
+                "end_epoch": end_epoch,
+                "ticks": len(run_values),
+                "duration_sec": max(0, end_epoch - start_epoch),
+                "mean_bps": round(statistics.fmean(run_values), 2),
+                "min_bps": round(min(run_values), 2),
+                "max_bps": round(max(run_values), 2),
+            }
+        )
+        run_start, run_values = None, []
+
+    for index, point in enumerate(series):
+        value = point["basis_bps"]
+        inside = abs(value) <= threshold_bps
+        matches = inside if kind == "held" else not inside and abs(value) >= threshold_bps
+        if matches:
+            if run_start is None:
+                run_start = index
+            run_values.append(value)
+        elif run_start is not None:
+            flush(index - 1)
+    if run_start is not None:
+        flush(len(series) - 1)
+    return runs
+
+
+def basis_report(
+    conn,
+    pair: str,
+    start: int,
+    end: int,
+    source: str = "binance",
+    held_bps: float = 15.0,
+    edge_bps: float = 40.0,
+    min_ticks: int = 3,
+) -> dict:
+    thresholds = {"held_bps": held_bps, "edge_bps": edge_bps, "min_ticks": min_ticks}
+    report: dict = {"pair": pair, "source": source, "thresholds": thresholds, "pools": {}}
+
+    aggregated = basis_series(conn, pair, start, end, source)
+    if aggregated:
+        report.update(_summarize_basis_series(aggregated, held_bps=held_bps, edge_bps=edge_bps, min_ticks=min_ticks))
+        report["aggregated"] = True
+    else:
+        report["aggregated"] = False
+
+    for dex in pool_dexes(conn, pair, start, end):
+        pool_series = pool_basis_series(conn, pair, dex, start, end)
+        if pool_series:
+            report["pools"][dex] = _summarize_basis_series(
+                pool_series, held_bps=held_bps, edge_bps=edge_bps, min_ticks=min_ticks
+            )
+
+    cross = cross_pool_series(conn, pair, start, end)
+    if cross:
+        spreads = [point["spread_bps"] for point in cross]
+        last = cross[-1]
+        report["cross_pool"] = {
+            "ticks": len(cross),
+            "last": {
+                "spread_bps": round(last["spread_bps"], 2),
+                "best_buy_dex": last["best_buy_dex"],
+                "best_buy_ref": last["best_buy_ref"],
+                "best_sell_dex": last["best_sell_dex"],
+                "best_sell_ref": last["best_sell_ref"],
+                "pool_count": last["pool_count"],
+            },
+            "stats": {
+                "mean_spread_bps": round(statistics.fmean(spreads), 2),
+                "max_spread_bps": round(max(spreads), 2),
+            },
+        }
+
+    if not aggregated and not report["pools"]:
+        report["status"] = "no paired CEX/on-chain ticks in window"
+    return report
+
+
+def _render_basis_leg(name: str, leg: dict, thresholds: dict) -> list[str]:
+    lines: list[str] = []
+    last = leg["last"]
+    stats = leg["stats"]
+    mid_text = price_fmt(last["mid"]) if last.get("mid") is not None else "-"
+    lines.append(
+        f"  {name:<10} basis {last['basis_bps']:+.2f} bps  "
+        f"(cex {mid_text} vs pool {price_fmt(last['onchain_ref'])})"
+    )
+    lines.append(
+        f"             {leg['ticks']} ticks  mean {stats['mean_bps']:+.2f} bps  "
+        f"range {stats['min_bps']:+.2f}..{stats['max_bps']:+.2f}"
+    )
+    held = leg["held_periods"]
+    edge = leg["edge_periods"]
+    lines.append(
+        f"             held {len(held)} ({leg['held_ticks_pct']}%)  "
+        f"edge {len(edge)} ({leg['edge_ticks_pct']}%)  "
+        f"(|basis|<={thresholds['held_bps']:.0f} / >={thresholds['edge_bps']:.0f} bps)"
+    )
+    return lines
+
+
+def render_basis(reports: list[dict]) -> str:
+    lines: list[str] = []
+    for report in reports:
+        if report.get("status") and not report.get("pools"):
+            lines.append(f"{report['pair']}@{report['source']}: {report['status']}")
+            continue
+        label = f"{report['pair']}@{report['source']}"
+        thresholds = report["thresholds"]
+        lines.append(f"=== {label} ===")
+
+        if report.get("aggregated") and "last" in report:
+            lines.extend(_render_basis_leg("aggregated", report, thresholds))
+
+        cross = report.get("cross_pool")
+        if cross:
+            last = cross["last"]
+            stats = cross["stats"]
+            lines.append(
+                f"  cross-pool {last['spread_bps']:+.2f} bps now  "
+                f"buy {last['best_buy_dex']}@{price_fmt(last['best_buy_ref'])}  "
+                f"sell {last['best_sell_dex']}@{price_fmt(last['best_sell_ref'])}  "
+                f"({last['pool_count']} pools)"
+            )
+            lines.append(
+                f"             mean spread {stats['mean_spread_bps']:+.2f} bps  "
+                f"max {stats['max_spread_bps']:+.2f} bps over {cross['ticks']} ticks"
+            )
+
+        for dex in sorted(report.get("pools", {})):
+            lines.extend(_render_basis_leg(dex, report["pools"][dex], thresholds))
+        lines.append("")
+
+    if any(not report.get("status") or report.get("pools") for report in reports):
+        lines.append("Basis is (cex_mid - pool_ref) / pool_ref per leg. Per-pool refs come from")
+        lines.append("parallel Jupiter quotes (JUPITER_DEXES) on the same tick as the CEX book.")
+        lines.append("Cross-pool spread is best_sell_pool minus best_buy_pool. No fees, latency or")
+        lines.append("execution path are counted — dry measurement for eyes, not send.")
+    return "\n".join(lines).rstrip()
+
+
 # --------------------------------------------------------------------------- cli
 
 
@@ -1090,6 +1445,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--stale-after",
         default="5m",
         help="flag a pair whose last tick is older than this in --latest (default: 5m)",
+    )
+    parser.add_argument(
+        "--basis",
+        action="store_true",
+        help="CEX mid vs on-chain Jupiter reference over --since, then exit",
+    )
+    parser.add_argument(
+        "--held-bps",
+        type=float,
+        default=15.0,
+        help="|basis| at or below this for consecutive ticks counts as a held period (default: 15)",
+    )
+    parser.add_argument(
+        "--edge-bps",
+        type=float,
+        default=40.0,
+        help="|basis| at or above this for consecutive ticks counts as an edge period (default: 40)",
+    )
+    parser.add_argument(
+        "--basis-min-ticks",
+        type=int,
+        default=3,
+        help="minimum consecutive ticks to count a held/edge period (default: 3)",
     )
     return parser
 
@@ -1169,6 +1547,46 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(f"oakring cross  |  {PEG_PAIR} vs the USDT/USDC books")
                 print(render_cross(reports))
+                print("")
+            return 0
+
+        if args.basis:
+            try:
+                since_sec = common.parse_duration(args.since)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            if args.basis_min_ticks < 1:
+                print("--basis-min-ticks must be >= 1", file=sys.stderr)
+                return 2
+            end_epoch = common.to_epoch(common.now_utc())
+            keys = basis_keys(conn, args.pairs, args.venue)
+            if not keys:
+                print(
+                    "no on-chain reference recorded yet - enable JUPITER_ENABLED=1 (and "
+                    "optionally JUPITER_DEXES=Raydium,Orca,Meteora DLMM) in the recorder "
+                    ".env and record for a while",
+                    file=sys.stderr,
+                )
+                return 1
+            reports = [
+                basis_report(
+                    conn,
+                    pair,
+                    end_epoch - since_sec,
+                    end_epoch,
+                    source,
+                    held_bps=args.held_bps,
+                    edge_bps=args.edge_bps,
+                    min_ticks=args.basis_min_ticks,
+                )
+                for pair, source in keys
+            ]
+            if args.format == "json":
+                print(json.dumps({"basis": reports}, indent=2))
+            else:
+                print("oakring basis  |  CEX mid vs Jupiter on-chain reference")
+                print(render_basis(reports))
                 print("")
             return 0
 

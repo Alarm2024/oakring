@@ -23,6 +23,7 @@ from dataclasses import replace
 from datetime import timedelta
 
 import common
+import jupiter
 import venues
 
 USER_AGENT = "oakring/3.0"
@@ -126,25 +127,102 @@ def compute_mid_spread(bid: float, ask: float) -> tuple[float, float]:
     return mid, spread_bps
 
 
+def compute_basis_bps(mid: float | None, onchain_ref: float | None) -> float | None:
+    """CEX mid vs on-chain reference, in basis points."""
+    if mid is None or onchain_ref is None or onchain_ref <= 0:
+        return None
+    return (mid - onchain_ref) / onchain_ref * 10000.0
+
+
 def row_from_quote(
-    ts: str, epoch: int, pair: str, source: str, quote: venues.Quote | None, fallback_note: str | None
+    ts: str,
+    epoch: int,
+    pair: str,
+    source: str,
+    quote: venues.Quote | None,
+    fallback_note: str | None,
+    onchain: jupiter.JupiterQuote | None = None,
+    onchain_note: str | None = None,
 ) -> tuple:
     """Build one `ticks` row, valid or errored."""
+    onchain_ref = onchain.ref_price if onchain is not None else None
+    onchain_impact = onchain.impact_bps if onchain is not None else None
     if quote is None:
-        return (ts, epoch, pair, source, None, None, None, None, None, None, fallback_note or "error:Missing")
+        return (
+            ts, epoch, pair, source, None, None, None, None, None, None,
+            fallback_note or "error:Missing", onchain_ref, onchain_impact, None, onchain_note,
+        )
     if quote.bid <= 0 or quote.ask <= 0 or quote.ask < quote.bid:
-        return (ts, epoch, pair, source, quote.bid, quote.ask, None, None,
-                quote.bid_qty, quote.ask_qty, "error:CrossedBook")
+        return (
+            ts, epoch, pair, source, quote.bid, quote.ask, None, None,
+            quote.bid_qty, quote.ask_qty, "error:CrossedBook",
+            onchain_ref, onchain_impact, None, onchain_note,
+        )
     mid, spread_bps = compute_mid_spread(quote.bid, quote.ask)
-    return (ts, epoch, pair, source, quote.bid, quote.ask, mid, spread_bps,
-            quote.bid_qty, quote.ask_qty, None)
+    basis_bps = compute_basis_bps(mid, onchain_ref)
+    return (
+        ts, epoch, pair, source, quote.bid, quote.ask, mid, spread_bps,
+        quote.bid_qty, quote.ask_qty, None, onchain_ref, onchain_impact, basis_bps, onchain_note,
+    )
+
+
+def _pad_row(row: tuple) -> tuple:
+    """Older callers wrote 11 columns; on-chain fields default to NULL."""
+    if len(row) == 11:
+        return row + (None, None, None, None)
+    return row
 
 
 def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    rows = [_pad_row(row) for row in rows]
     conn.executemany(
         """
         INSERT INTO ticks
-            (ts_utc, ts_epoch, pair, source, bid, ask, mid, spread_bps, bid_qty, ask_qty, note)
+            (ts_utc, ts_epoch, pair, source, bid, ask, mid, spread_bps, bid_qty, ask_qty, note,
+             onchain_ref, onchain_impact_bps, basis_bps, onchain_note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def pool_sample_rows(
+    ts: str,
+    epoch: int,
+    pair: str,
+    cex_mid: float | None,
+    samples: list[jupiter.PoolSample],
+) -> list[tuple]:
+    rows: list[tuple] = []
+    for sample in samples:
+        basis_bps = compute_basis_bps(cex_mid, sample.ref_price)
+        rows.append(
+            (
+                ts,
+                epoch,
+                pair,
+                sample.dex,
+                sample.ref_price,
+                basis_bps,
+                sample.impact_bps,
+                sample.in_amount,
+                sample.out_amount,
+                sample.amm_key,
+                sample.note,
+            )
+        )
+    return rows
+
+
+def insert_pool_samples(conn: sqlite3.Connection, rows: list[tuple]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO pool_samples
+            (ts_utc, ts_epoch, pair, dex, ref_price, basis_bps, impact_bps,
+             in_amount, out_amount, amm_key, note)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
@@ -152,11 +230,79 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
     conn.commit()
 
 
+def record_pool_samples(
+    conn: sqlite3.Connection,
+    ts: str,
+    epoch: int,
+    cex_mids: dict[str, float],
+    jupiter_cfg: dict[str, object],
+    timeout: int,
+) -> list[tuple]:
+    """Fetch per-DEX quotes for attached pairs and write pool_samples rows."""
+    dexes = jupiter_cfg.get("dexes") or []
+    attach_pairs = jupiter_cfg.get("attach_pairs") or set()
+    if not dexes or not attach_pairs:
+        return []
+
+    pool_rows: list[tuple] = []
+    for pair in sorted(attach_pairs):
+        cex_mid = cex_mids.get(pair)
+        samples = jupiter.fetch_pool_samples_for_pair(
+            pair, jupiter_cfg, timeout, http_get=_jupiter_http_get
+        )
+        pool_rows.extend(pool_sample_rows(ts, epoch, pair, cex_mid, samples))
+    insert_pool_samples(conn, pool_rows)
+    return pool_rows
+
+
+def fetch_jupiter_quote(
+    jupiter_cfg: dict[str, object],
+    timeout: int,
+) -> tuple[jupiter.JupiterQuote | None, str | None]:
+    """One Jupiter quote per tick, retried like venue fetches."""
+    if not jupiter_cfg.get("enabled"):
+        return None, None
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            quote = jupiter.fetch_quote(
+                base_url=str(jupiter_cfg["quote_url"]),
+                input_mint=str(jupiter_cfg["input_mint"]),
+                output_mint=str(jupiter_cfg["output_mint"]),
+                amount=int(jupiter_cfg["amount"]),
+                slippage_bps=int(jupiter_cfg["slippage_bps"]),
+                input_decimals=int(jupiter_cfg["input_decimals"]),
+                output_decimals=int(jupiter_cfg["output_decimals"]),
+                timeout=timeout,
+                api_key=jupiter_cfg.get("api_key"),  # type: ignore[arg-type]
+                http_get=_jupiter_http_get,
+            )
+            return quote, None
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < 2 and not _shutdown.is_set():
+                delay = min(2.0**attempt, 10.0)
+                logging.warning(
+                    "jupiter fetch failed (%s), retrying in %.0fs",
+                    jupiter.describe_error(exc),
+                    delay,
+                )
+                _shutdown.wait(delay)
+    return None, jupiter.describe_error(last_error)
+
+
+def _jupiter_http_get(url: str, timeout: int, headers: dict[str, str]) -> object:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
 def run_tick(
     conn: sqlite3.Connection,
     watchlists: dict[str, dict[str, str]],
     timeout: int,
     max_retries: int,
+    jupiter_cfg: dict[str, object] | None = None,
 ) -> None:
     """One round across every venue, all stamped with the same timestamp.
 
@@ -166,6 +312,9 @@ def run_tick(
     moment = common.now_utc()
     ts, epoch = common.to_ts_utc(moment), common.to_epoch(moment)
     rows: list[tuple] = []
+    jupiter_cfg = jupiter_cfg or {"enabled": False}
+    onchain_quote, onchain_error = fetch_jupiter_quote(jupiter_cfg, timeout)
+    attach_pairs = jupiter_cfg.get("attach_pairs") or set()
 
     for name, pairs in watchlists.items():
         try:
@@ -176,18 +325,51 @@ def run_tick(
 
         quotes, error = fetch_with_retries(venue, pairs, timeout, max_retries)
         for pair in pairs:
-            rows.append(row_from_quote(ts, epoch, pair, name, quotes.get(pair), error))
+            onchain = onchain_quote if pair in attach_pairs else None
+            onchain_note = onchain_error if pair in attach_pairs else None
+            rows.append(
+                row_from_quote(ts, epoch, pair, name, quotes.get(pair), error, onchain, onchain_note)
+            )
 
     insert_rows(conn, rows)
+
+    cex_mids = {
+        row[2]: row[6]
+        for row in rows
+        if row[2] in attach_pairs and row[10] is None and row[6] is not None
+    }
+    pool_rows = record_pool_samples(conn, ts, epoch, cex_mids, jupiter_cfg, timeout)
 
     multi = len(watchlists) > 1
     for row in rows:
         pair, source, bid, ask, mid, spread_bps, note = row[2], row[3], row[4], row[5], row[6], row[7], row[10]
+        onchain_ref, basis_bps, onchain_note = row[11], row[13], row[14]
         label = f"{source} {pair}" if multi else pair
         if note:
             logging.warning("%s %s", label, note)
+        elif onchain_ref is not None and basis_bps is not None:
+            logging.info(
+                "%s bid=%s ask=%s mid=%.8f spread_bps=%.2f onchain_ref=%.8f basis_bps=%+.2f",
+                label, bid, ask, mid, spread_bps, onchain_ref, basis_bps,
+            )
         else:
             logging.info("%s bid=%s ask=%s mid=%.8f spread_bps=%.2f", label, bid, ask, mid, spread_bps)
+        if onchain_note and pair in attach_pairs:
+            logging.warning("%s onchain %s", label, onchain_note)
+
+    pools_by_pair: dict[str, list[tuple]] = {}
+    for row in pool_rows:
+        pools_by_pair.setdefault(row[2], []).append(row)
+    for pair, samples in pools_by_pair.items():
+        label = pair if not multi else f"binance {pair}"
+        priced = [sample for sample in samples if sample[4] is not None and sample[10] is None]
+        if not priced:
+            continue
+        parts = []
+        for sample in priced:
+            dex, ref, basis = sample[3], sample[4], sample[5]
+            parts.append(f"{dex}={ref:.4f}({basis:+.1f}bps)" if basis is not None else f"{dex}={ref:.4f}")
+        logging.info("%s pools: %s", label, "  ".join(parts))
 
 
 def prune(conn: sqlite3.Connection, retention_days: int) -> int:
@@ -195,11 +377,18 @@ def prune(conn: sqlite3.Connection, retention_days: int) -> int:
     if retention_days <= 0:
         return 0
     cutoff = common.to_epoch(common.now_utc() - timedelta(days=retention_days))
-    cursor = conn.execute("DELETE FROM ticks WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
+    tick_cursor = conn.execute("DELETE FROM ticks WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
+    pool_cursor = conn.execute("DELETE FROM pool_samples WHERE ts_epoch > 0 AND ts_epoch < ?", (cutoff,))
     conn.commit()
-    if cursor.rowcount > 0:
-        logging.info("pruned %d ticks older than %d days", cursor.rowcount, retention_days)
-    return cursor.rowcount
+    removed = tick_cursor.rowcount + pool_cursor.rowcount
+    if removed > 0:
+        logging.info(
+            "pruned %d ticks and %d pool samples older than %d days",
+            tick_cursor.rowcount,
+            pool_cursor.rowcount,
+            retention_days,
+        )
+    return removed
 
 
 def next_tick_at(now: float, interval_sec: int) -> float:
@@ -260,6 +449,7 @@ def main() -> None:
         raise SystemExit(probe(common.parse_watchlist(",".join(args.probe) or "SOLUSDC"), timeout))
 
     watchlists = common.watchlists_from(env)
+    jupiter_cfg = jupiter.config_from(env)
     interval_sec = common.env_int(env, "INTERVAL_SEC", 60, minimum=1)
     timeout = common.env_int(env, "HTTP_TIMEOUT_SEC", 15, minimum=1)
     max_retries = common.env_int(env, "MAX_RETRIES", 2, minimum=0)
@@ -285,11 +475,22 @@ def main() -> None:
         db_path,
         f"{retention_days}d" if retention_days else "forever",
     )
+    if jupiter_cfg["enabled"]:
+        listed = ", ".join(sorted(jupiter_cfg["attach_pairs"]))  # type: ignore[arg-type]
+        logging.info(
+            "jupiter on-chain ref for %s via %s -> %s",
+            listed or "(none)",
+            jupiter_cfg["input_mint"],
+            jupiter_cfg["output_mint"],
+        )
+        dexes = jupiter_cfg.get("dexes") or []
+        if dexes:
+            logging.info("jupiter per-pool samples: %s", ", ".join(dexes))  # type: ignore[arg-type]
 
     last_prune = 0.0
     try:
         while not _shutdown.is_set():
-            run_tick(conn, watchlists, timeout, max_retries)
+            run_tick(conn, watchlists, timeout, max_retries, jupiter_cfg)
 
             now = time.time()
             if retention_days and now - last_prune > 3600:

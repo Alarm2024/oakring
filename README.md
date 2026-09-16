@@ -13,6 +13,7 @@ Record for a while first. A cycle you cannot see three of is not a cycle you hav
 
 - Python 3.9+ (stdlib only, no packages to install; developed and tested on 3.11)
 - Outbound HTTPS to Binance (no listen sockets, no wallets, no API keys — `bookTicker` is a public endpoint)
+- Optional outbound HTTPS to [Jupiter](https://station.jup.ag/docs/apis/swap-api) for an on-chain SOL/USDC reference (public quote endpoint; API key only if your deployment requires it)
 
 ## Install
 
@@ -63,6 +64,17 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 | `MAX_RETRIES` | `2` | Retries per tick, exponential backoff, then a per-pair fallback |
 | `RETENTION_DAYS` | `0` (keep all) | Prune ticks older than this, checked hourly |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
+| `JUPITER_ENABLED` | off | Set `1` to sample a Jupiter quote on each tick |
+| `JUPITER_ATTACH_PAIRS` | `SOLUSDT,SOLUSDC` | CEX pairs that receive `onchain_ref` / `basis_bps` columns |
+| `JUPITER_DEXES` | unset | Comma-separated DEX labels for per-pool samples (e.g. `Raydium,Orca,Meteora DLMM`) |
+| `JUPITER_ONLY_DIRECT_ROUTES` | `1` | Single-hop routes when sampling each DEX |
+| `JUPITER_QUOTE_URL` | `https://quote-api.jup.ag/v6/quote` | Public quote endpoint |
+| `JUPITER_INPUT_MINT` / `JUPITER_OUTPUT_MINT` | wrapped SOL / USDC | USDC leg for `*USDC` pairs |
+| `JUPITER_USDT_MINT` / `JUPITER_USDT_DECIMALS` | mainnet USDT / `6` | USDT leg for `*USDT` pairs |
+| `JUPITER_AMOUNT_LAMPORTS` | `1000000000` | Quote size (1 SOL) |
+| `JUPITER_SLIPPAGE_BPS` | `50` | Slippage passed to the quote route finder |
+| `JUPITER_INPUT_DECIMALS` / `JUPITER_OUTPUT_DECIMALS` | `9` / `6` | Decode raw mint amounts into a price |
+| `JUPITER_API_KEY` | unset | Optional; read from env only, never commit |
 
 ## Analysing the recording
 
@@ -73,6 +85,7 @@ python3 analyze.py --latest                              # price right now, ever
 python3 analyze.py --list-pairs                          # what has been recorded
 python3 analyze.py --auto                                # let it pick the settings
 python3 analyze.py --cross --since 12h                   # USDT vs USDC vs the peg
+python3 analyze.py --basis --since 12h                   # CEX mid vs Jupiter on-chain ref
 python3 analyze.py --venues --since 12h                  # the same pair across exchanges
 python3 analyze.py --since 7d  --bucket 1h               # every pair, the default view
 python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
@@ -84,6 +97,10 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 |------|---------|---------|
 | `--latest` | off | Current price per pair with 1h/24h/7d change, then exit |
 | `--cross` | off | USDT vs USDC books against the peg, over `--since`, then exit |
+| `--basis` | off | CEX mid vs on-chain Jupiter reference, held/edge periods, then exit |
+| `--held-bps` | `15` | \|basis\| at or below this for `--basis-min-ticks` counts as held |
+| `--edge-bps` | `40` | \|basis\| at or above this for `--basis-min-ticks` counts as edge |
+| `--basis-min-ticks` | `3` | Minimum consecutive ticks for a held or edge period |
 | `--venues` | off | Compare each pair across the venues recording it, then exit |
 | `--venue` | all | Restrict any command to one venue |
 | `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
@@ -304,6 +321,31 @@ BTC  2026-09-14T23:31:00Z
 
 The percentage is the useful number over time: a pair whose residual sits inside the spread all day is quoted coherently, while one that spends most of its time outside a very tight spread is mostly showing you measurement noise.
 
+## CEX vs on-chain basis (Jupiter)
+
+Optional dry measurement: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter public quotes on each tick and stores them next to the CEX book on the configured pairs (`JUPITER_ATTACH_PAIRS`, default `SOLUSDT,SOLUSDC`). Both legs share the same timestamp, so basis is available at tick resolution — typically one sample per `INTERVAL_SEC` tick when quotes succeed (sequential DEX fetches and retries can push the effective cadence above `INTERVAL_SEC`; failed ticks are skipped gracefully), instead of the ~30s journal samples elsewhere. CEX mids used for per-pool basis are keyed by pair name only (Binance-only today).
+
+Two layers are recorded:
+
+1. **Aggregated** — one best-route quote on the `ticks` row (`onchain_ref`, `basis_bps`), same as before.
+2. **Per-pool** — when `JUPITER_DEXES` is set, parallel quotes restricted to each DEX (Raydium, Orca, Meteora DLMM, …) land in the `pool_samples` child table. SOLUSDC pairs quote against USDC; SOLUSDT pairs quote against USDT automatically.
+
+```bash
+# in ~/.config/oakring/.env
+JUPITER_ENABLED=1
+JUPITER_DEXES=Raydium,Orca,Meteora DLMM
+JUPITER_ATTACH_PAIRS=SOLUSDT,SOLUSDC
+INTERVAL_SEC=1
+
+# then, after recording:
+python3 analyze.py --basis --since 12h
+python3 analyze.py --basis --since 2h --held-bps 15 --edge-bps 40 --format json
+```
+
+`basis_bps = (cex_mid - pool_ref) / pool_ref * 10000` per leg. `--basis` reports aggregated and **per-pool** held/edge periods, plus **cross-pool spread** (cheapest pool vs dearest pool on the same tick — same-pool vs cross-pool visibility). No swap is built, no wallet is touched, and no API key is required for the public quote endpoint unless your deployment needs one via `JUPITER_API_KEY`.
+
+**This is eyes, not send.** Route impact, latency, fees and execution path are not counted — the same caveat as `--cross`.
+
 ## Alerts
 
 A recorder that dies quietly is the one real risk to a project like this: the history you wanted is simply missing, and you find out days later. `alert.py` watches for that and tells you.
@@ -449,6 +491,22 @@ GROUP BY hour ORDER BY hour DESC LIMIT 48;
 | `bid`, `ask`, `mid`, `spread_bps` | NULL on an errored tick |
 | `bid_qty`, `ask_qty` | Top-of-book sizes, used for the imbalance figure |
 | `note` | NULL when good, otherwise `error:HTTPError:418`, `error:URLError`, `error:CrossedBook`, … |
+| `onchain_ref` | Jupiter-implied price for the configured mint pair (e.g. USDC per SOL), sampled on the same tick |
+| `onchain_impact_bps` | Route price impact from the Jupiter quote, in basis points |
+| `basis_bps` | `(mid - onchain_ref) / onchain_ref * 10000` when both legs are present |
+| `onchain_note` | NULL when the Jupiter quote succeeded, otherwise `error:HTTPError:…`, `error:URLError`, … |
+
+`pool_samples`, one row per DEX per attached pair per tick (when `JUPITER_DEXES` is set):
+
+| Column | Notes |
+|--------|-------|
+| `ts_utc` / `ts_epoch` | Same instant as the parent CEX tick |
+| `pair` | CEX pair, e.g. `SOLUSDC` |
+| `dex` | Jupiter DEX label, e.g. `Raydium` |
+| `ref_price` | Implied on-chain mid from that pool's quote |
+| `basis_bps` | CEX mid vs this pool at the same timestamp |
+| `impact_bps`, `in_amount`, `out_amount`, `amm_key` | From the Jupiter quote / routePlan |
+| `note` | NULL when good, otherwise an error marker |
 
 A database written by the first version of the recorder is migrated in place on the next start: the new columns are added and `ts_epoch` is backfilled from `ts_utc`.
 
@@ -471,6 +529,7 @@ python3 -m unittest discover -s tests -v
 | File | Purpose |
 |------|---------|
 | `recorder.py` | Poll loop: every venue, retries, error rows, pruning, clean shutdown |
+| `jupiter.py` | Optional Jupiter public quote fetch and on-chain reference price |
 | `venues.py` | Per-exchange symbols, URLs and response parsing |
 | `report.sh` | Writes a timestamped report; what the timer runs |
 | `check.sh` | Health check: services, freshness, errors, prices |
@@ -480,6 +539,8 @@ python3 -m unittest discover -s tests -v
 | `common.py` | Shared config, database open/migrate, time helpers |
 | `schema.sql` | `ticks` table and indexes |
 | `tests/test_oakring.py` | Offline test suite |
+| `tests/test_jupiter.py` | Jupiter quote parsing, recorder attach, `--basis` analysis |
+| `tests/fixtures/jupiter_quote_*.json` | Sample Jupiter `/v6/quote` responses (aggregated + per-DEX) |
 | `.env.example` | Sample configuration (copy to `~/.config/oakring/.env`) |
 | `oakring.service` | Hardened systemd unit template |
 | `oakring-report.{service,timer}` | Scheduled weekly report |

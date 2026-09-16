@@ -1,0 +1,18 @@
+{
+  "inputMint": "So11111111111111111111111111111111111111112",
+  "inAmount": "1000000000",
+  "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "outAmount": "150320000",
+  "priceImpactPct": "0.0080",
+  "routePlan": [
+    {
+      "swapInfo": {
+        "ammKey": "orca-pool-xyz",
+        "label": "Orca",
+        "inAmount": "1000000000",
+        "outAmount": "150320000"
+      },
+      "percent": 100
+    }
+  ]
+}
