@@ -387,5 +387,80 @@ class VenueComparisonTests(unittest.TestCase):
         self.assertTrue(any(bar.high - bar.low > 50 for bar in mixed))
 
 
+class JupiterOnChainTests(unittest.TestCase):
+    """The only on-chain venue, and the only one that is not a two-sided book.
+
+    Everything else here is a centralised exchange with resting bids and asks.
+    An AMM has a curve: what Jupiter returns is what a *sell* of a stated size
+    would actually receive. These tests pin that difference rather than paper
+    over it, because a one-sided quote dressed as a book is exactly the kind of
+    number that reads as health and means absence.
+    """
+
+    # A real Jupiter v1 quote: 1 SOL in (9 decimals), USDC out (6 decimals).
+    PAYLOAD = {
+        "inputMint": "So11111111111111111111111111111111111111112",
+        "inAmount": "1000000000",
+        "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "outAmount": "142370000",
+        "swapMode": "ExactIn",
+        "slippageBps": 50,
+        "routePlan": [],
+    }
+
+    def test_decimals_are_applied_to_both_sides(self) -> None:
+        """**The failure this exists for is a factor of a thousand.**
+
+        SOL is 9 decimals and USDC is 6. Dividing the raw integers gives
+        0.1424 instead of 142.37 — a number small enough to look like a
+        different pair rather than like a bug, and one that would poison every
+        basis computed from it.
+        """
+        quote = venues.get("jupiter").parse(self.PAYLOAD, "SOLUSDC")["SOLUSDC"]
+        self.assertAlmostEqual(quote.bid, 142.37, places=6)
+        raw_ratio = 142370000 / 1000000000
+        self.assertNotAlmostEqual(quote.bid, raw_ratio, places=3)
+
+    def test_the_quote_is_one_sided_and_says_so(self) -> None:
+        quote = venues.get("jupiter").parse(self.PAYLOAD, "SOLUSDC")["SOLUSDC"]
+        self.assertEqual(quote.bid, quote.ask, "an AMM sell price has no other side")
+        self.assertEqual(quote.bid_qty, 0.0)
+        self.assertEqual(quote.ask_qty, 0.0)
+
+    def test_it_is_not_in_the_two_sided_sample_set(self) -> None:
+        """Deliberate: SAMPLES drives a test asserting ask > bid and qty > 0.
+
+        Jupiter satisfies neither and never will. Adding it there would not
+        expose a defect, it would force someone to fake a spread — so the
+        exclusion is asserted here, with the reason, instead of being an
+        omission a later reader mistakes for an oversight.
+        """
+        self.assertNotIn("jupiter", SAMPLES)
+        self.assertIn("jupiter", venues.VENUES)
+
+    def test_unmapped_pairs_are_refused_before_they_are_priced(self) -> None:
+        with self.assertRaises(venues.VenueError):
+            venues.get("jupiter").to_symbol("BTCUSDC")
+
+    def test_a_broken_answer_raises_instead_of_returning_a_number(self) -> None:
+        jupiter = venues.get("jupiter")
+        for payload in (
+            {"error": "no routes found"},
+            {"inAmount": "1000000000"},
+            {"inAmount": "0", "outAmount": "1"},
+            [],
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(venues.VenueError):
+                    jupiter.parse(payload, "SOLUSDC")
+
+    def test_url_carries_both_mints_and_a_stated_size(self) -> None:
+        venue = venues.get("jupiter")
+        url = venue.build_url(venue.base_url, ["SOLUSDT"])
+        self.assertIn(venues.SOLANA_MINTS["SOL"][0], url)
+        self.assertIn(venues.SOLANA_MINTS["USDT"][0], url)
+        self.assertIn(str(venues.JUPITER_PROBE_BASE_UNITS), url)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -207,6 +207,79 @@ def bybit_parse(payload: object, symbol: str) -> dict[str, Quote]:
     }
 
 
+# --------------------------------------------------------------------------- jupiter (on-chain)
+
+# Solana mints. A DEX quote is priced in atomic units, so the decimals matter
+# as much as the address: get one wrong and the price is out by a power of ten
+# rather than visibly broken.
+SOLANA_MINTS: dict[str, tuple[str, int]] = {
+    "SOL":  ("So11111111111111111111111111111111111111112", 9),
+    "USDC": ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 6),
+    "USDT": ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 6),
+}
+
+# How much to ask a price for. A DEX has no "top of book": the price you get
+# depends on how much you move, so a size has to be chosen and stated. 1 SOL is
+# small enough that impact is not the dominant term and large enough to be a
+# real route rather than dust.
+JUPITER_PROBE_BASE_UNITS = 1_000_000_000  # 1 SOL
+
+
+def jupiter_symbol(pair: str) -> str:
+    base, quote = split_pair(pair)
+    if base not in SOLANA_MINTS or quote not in SOLANA_MINTS:
+        raise VenueError(
+            f"{pair} has no Solana mint in this table - known: {', '.join(sorted(SOLANA_MINTS))}"
+        )
+    return pair.upper()
+
+
+def jupiter_url(base_url: str, symbols: list[str]) -> str:
+    base, quote = split_pair(symbols[0])
+    in_mint, _ = SOLANA_MINTS[base]
+    out_mint, _ = SOLANA_MINTS[quote]
+    return (
+        f"{base_url}/swap/v1/quote?inputMint={in_mint}&outputMint={out_mint}"
+        f"&amount={JUPITER_PROBE_BASE_UNITS}&slippageBps=50&restrictIntermediateTokens=true"
+    )
+
+
+def jupiter_parse(payload: object, symbol: str) -> dict[str, Quote]:
+    """One sell-side price, and it is honest about being one-sided.
+
+    **There is no bid/ask here and pretending otherwise would be the whole
+    danger.** A CEX book has two resting sides; an AMM has a curve, and what
+    Jupiter returns is what a *sell* of `JUPITER_PROBE_BASE_UNITS` would
+    actually receive. Quoting the other direction costs a second request and
+    is not the same number, because the two legs cross different pools.
+
+    So bid == ask == the executable sell price, and `spread_bps` computes to
+    zero. A zero spread here means "not measured", never "infinitely liquid" —
+    the sister desk has already been bitten once by a number that looked like
+    health and meant absence.
+    """
+    if not isinstance(payload, dict):
+        raise VenueError("expected an object")
+    if payload.get("error"):
+        raise VenueError(str(payload["error"]))
+    out_raw = payload.get("outAmount")
+    in_raw = payload.get("inAmount")
+    if out_raw is None or in_raw is None:
+        raise VenueError("quote carried no inAmount/outAmount")
+
+    base, quote = split_pair(symbol)
+    _, in_dec = SOLANA_MINTS[base]
+    _, out_dec = SOLANA_MINTS[quote]
+
+    in_amt = _number(in_raw, "inAmount") / (10 ** in_dec)
+    out_amt = _number(out_raw, "outAmount") / (10 ** out_dec)
+    if in_amt <= 0:
+        raise VenueError(f"inAmount is not positive: {in_raw!r}")
+    price = out_amt / in_amt
+
+    return {symbol: Quote(price, price, 0.0, 0.0)}
+
+
 # --------------------------------------------------------------------------- registry
 
 
@@ -240,6 +313,15 @@ VENUES: dict[str, Venue] = {
     "bybit": Venue(
         "bybit", "https://api.bybit.com",
         bybit_symbol, bybit_url, bybit_parse, False,
+    ),
+    # The only ON-CHAIN venue here, and the reason the rest become useful for
+    # arbitrage: every other entry is a centralised exchange, so oakring could
+    # compare Binance to Coinbase but could not compute a CEX-DEX basis at all.
+    # That basis is the quantity the 350 desk exists for and the one its own
+    # 30s scan poll could only alias.
+    "jupiter": Venue(
+        "jupiter", "https://lite-api.jup.ag",
+        jupiter_symbol, jupiter_url, jupiter_parse, False,
     ),
 }
 
