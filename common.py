@@ -34,6 +34,10 @@ EXPECTED_COLUMNS: dict[str, str] = {
     "bid_qty": "REAL",
     "ask_qty": "REAL",
     "note": "TEXT",
+    "onchain_ref": "REAL",
+    "onchain_impact_bps": "REAL",
+    "basis_bps": "REAL",
+    "onchain_note": "TEXT",
 }
 
 
@@ -84,6 +88,16 @@ EXPECTED_ENV_KEYS = (
     "MAX_RETRIES",
     "RETENTION_DAYS",
     "LOG_LEVEL",
+    "JUPITER_ENABLED",
+    "JUPITER_ATTACH_PAIRS",
+    "JUPITER_QUOTE_URL",
+    "JUPITER_INPUT_MINT",
+    "JUPITER_OUTPUT_MINT",
+    "JUPITER_AMOUNT_LAMPORTS",
+    "JUPITER_SLIPPAGE_BPS",
+    "JUPITER_INPUT_DECIMALS",
+    "JUPITER_OUTPUT_DECIMALS",
+    "JUPITER_API_KEY",
 )
 
 

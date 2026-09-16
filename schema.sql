@@ -12,7 +12,11 @@ CREATE TABLE IF NOT EXISTS ticks (
     spread_bps REAL,
     bid_qty REAL,
     ask_qty REAL,
-    note TEXT
+    note TEXT,
+    onchain_ref REAL,
+    onchain_impact_bps REAL,
+    basis_bps REAL,
+    onchain_note TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_ticks_pair_ts ON ticks (pair, ts_utc);
