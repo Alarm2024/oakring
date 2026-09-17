@@ -1049,8 +1049,33 @@ def render_csv(pair: str, bars: list[Bar]) -> str:
 # --------------------------------------------------------------------------- basis (CEX vs on-chain)
 
 
+def dual_venue_basis_pairs(conn, wanted: list[str] | None = None) -> list[str]:
+    """Pairs recorded on both a CEX source and Jupiter with priced mids."""
+    rows = conn.execute(
+        """
+        SELECT b.pair
+        FROM (
+            SELECT DISTINCT pair FROM ticks
+            WHERE source = 'binance' AND mid IS NOT NULL AND note IS NULL
+        ) b
+        INNER JOIN (
+            SELECT DISTINCT pair FROM ticks
+            WHERE source = 'jupiter' AND mid IS NOT NULL AND note IS NULL
+        ) j ON j.pair = b.pair
+        ORDER BY b.pair
+        """
+    ).fetchall()
+    pairs = [row["pair"] for row in rows]
+    if wanted:
+        names = {name.upper() for name in wanted}
+        pairs = [pair for pair in pairs if pair.upper() in names]
+    return pairs
+
+
 def basis_keys(conn, wanted: list[str] | None = None, venue: str | None = None) -> list[tuple[str, str]]:
-    """Pairs with aggregated on-chain ref and/or per-pool samples recorded."""
+    """Pairs with dual-venue CEX/Jupiter ticks, on-chain ref, and/or per-pool samples."""
+    keys: list[tuple[str, str]] = [(pair, "binance") for pair in dual_venue_basis_pairs(conn, wanted)]
+
     rows = conn.execute(
         """
         SELECT DISTINCT pair, source
@@ -1062,13 +1087,90 @@ def basis_keys(conn, wanted: list[str] | None = None, venue: str | None = None) 
         ORDER BY pair, source
         """
     ).fetchall()
-    keys = [(row["pair"], row["source"]) for row in rows]
+    for row in rows:
+        key = (row["pair"], row["source"])
+        if key not in keys:
+            keys.append(key)
     if wanted:
         names = {name.upper() for name in wanted}
         keys = [key for key in keys if key[0].upper() in names]
     if venue:
-        keys = [key for key in keys if key[1].lower() == venue.lower()]
+        venue_lower = venue.lower()
+        if venue_lower == "jupiter":
+            keys = [key for key in keys if key in dual_venue_basis_pairs(conn, wanted)]
+        else:
+            keys = [key for key in keys if key[1].lower() == venue_lower]
     return keys
+
+
+def dual_venue_basis_series(
+    conn,
+    pair: str,
+    start: int,
+    end: int,
+    cex_source: str = "binance",
+    dex_source: str = "jupiter",
+) -> list[dict]:
+    """Per-tick basis from CEX and Jupiter mids joined on ts_epoch."""
+    rows = conn.execute(
+        f"""
+        SELECT b.ts_epoch AS epoch, b.mid AS cex_mid, j.mid AS dex_mid
+        FROM ticks b
+        INNER JOIN ticks j
+          ON j.pair = b.pair AND j.ts_epoch = b.ts_epoch AND b.ts_epoch > 0
+        WHERE b.pair = ? AND b.source = ? AND j.source = ?
+          AND b.mid IS NOT NULL AND j.mid IS NOT NULL
+          AND b.note IS NULL AND j.note IS NULL
+          AND b.ts_epoch BETWEEN ? AND ?
+        ORDER BY epoch
+        """,
+        (pair, cex_source, dex_source, start, end),
+    ).fetchall()
+
+    series: list[dict] = []
+    for row in rows:
+        cex_mid = float(row["cex_mid"])
+        dex_mid = float(row["dex_mid"])
+        if dex_mid <= 0:
+            continue
+        basis_bps = (cex_mid - dex_mid) / dex_mid * 10000.0
+        series.append(
+            {
+                "epoch": int(row["epoch"]),
+                "mid": cex_mid,
+                "onchain_ref": dex_mid,
+                "cex_mid": cex_mid,
+                "dex_mid": dex_mid,
+                "basis_bps": float(basis_bps),
+            }
+        )
+    return series
+
+
+def _source_span(conn, pair: str, source: str, start: int, end: int) -> dict:
+    """How long one venue has priced ticks in the window."""
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS ticks,
+               MIN({EPOCH_SQL}) AS first_epoch,
+               MAX({EPOCH_SQL}) AS last_epoch
+        FROM ticks
+        WHERE pair = ? AND source = ? AND mid IS NOT NULL AND note IS NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        """,
+        (pair, source, start, end),
+    ).fetchone()
+    ticks = int(row["ticks"] or 0)
+    if ticks < 2:
+        span = 0
+    else:
+        span = max(0, int(row["last_epoch"]) - int(row["first_epoch"]))
+    return {
+        "ticks": ticks,
+        "span_sec": span,
+        "span_human": common.format_duration(span),
+        "meets_24h": span >= 86400,
+    }
 
 
 def basis_series(conn, pair: str, start: int, end: int, source: str = "binance") -> list[dict]:
@@ -1200,11 +1302,20 @@ def cross_pool_series(conn, pair: str, start: int, end: int) -> list[dict]:
     return series
 
 
+def _median_tick_interval(series: list[dict]) -> float | None:
+    """Median seconds between consecutive joined ticks (1.0 when INTERVAL_SEC=1)."""
+    if len(series) < 2:
+        return None
+    gaps = [series[index + 1]["epoch"] - series[index]["epoch"] for index in range(len(series) - 1)]
+    return float(statistics.median(gaps))
+
+
 def _summarize_basis_series(
     series: list[dict],
     *,
     held_bps: float,
     edge_bps: float,
+    floor_bps: float,
     min_ticks: int,
 ) -> dict:
     values = [point["basis_bps"] for point in series]
@@ -1212,14 +1323,19 @@ def _summarize_basis_series(
     span = series[-1]["epoch"] - series[0]["epoch"]
     held = _basis_runs(series, kind="held", threshold_bps=held_bps, min_ticks=min_ticks)
     edge = _basis_runs(series, kind="edge", threshold_bps=edge_bps, min_ticks=min_ticks)
+    episodes = _basis_runs(series, kind="edge", threshold_bps=floor_bps, min_ticks=min_ticks)
+    median_interval = _median_tick_interval(series)
     return {
         "ticks": len(series),
         "span_sec": span,
         "span_human": common.format_duration(span),
+        "median_tick_sec": median_interval,
         "last": {
             "epoch": last["epoch"],
             "mid": last.get("mid"),
             "onchain_ref": last["onchain_ref"],
+            "cex_mid": last.get("cex_mid", last.get("mid")),
+            "dex_mid": last.get("dex_mid", last.get("onchain_ref")),
             "basis_bps": round(last["basis_bps"], 2),
             "impact_bps": last.get("impact_bps"),
             "dex": last.get("dex"),
@@ -1232,8 +1348,10 @@ def _summarize_basis_series(
         },
         "held_periods": held,
         "edge_periods": edge,
+        "episodes": episodes,
         "held_ticks_pct": round(100.0 * sum(run["ticks"] for run in held) / len(series), 1),
         "edge_ticks_pct": round(100.0 * sum(run["ticks"] for run in edge) / len(series), 1),
+        "episode_ticks_pct": round(100.0 * sum(run["ticks"] for run in episodes) / len(series), 1),
     }
 
 
@@ -1293,23 +1411,70 @@ def basis_report(
     source: str = "binance",
     held_bps: float = 15.0,
     edge_bps: float = 40.0,
+    floor_bps: float = 40.0,
     min_ticks: int = 3,
+    dex_source: str = "jupiter",
 ) -> dict:
-    thresholds = {"held_bps": held_bps, "edge_bps": edge_bps, "min_ticks": min_ticks}
+    thresholds = {
+        "held_bps": held_bps,
+        "edge_bps": edge_bps,
+        "floor_bps": floor_bps,
+        "min_ticks": min_ticks,
+    }
     report: dict = {"pair": pair, "source": source, "thresholds": thresholds, "pools": {}}
 
-    aggregated = basis_series(conn, pair, start, end, source)
-    if aggregated:
-        report.update(_summarize_basis_series(aggregated, held_bps=held_bps, edge_bps=edge_bps, min_ticks=min_ticks))
+    dual = dual_venue_basis_series(conn, pair, start, end, source, dex_source)
+    if dual:
+        report["mode"] = "dual_venue"
+        report["dex_source"] = dex_source
+        report.update(
+            _summarize_basis_series(
+                dual,
+                held_bps=held_bps,
+                edge_bps=edge_bps,
+                floor_bps=floor_bps,
+                min_ticks=min_ticks,
+            )
+        )
         report["aggregated"] = True
+        report["coverage"] = {
+            "cex": _source_span(conn, pair, source, start, end),
+            "dex": _source_span(conn, pair, dex_source, start, end),
+            "paired": {
+                "ticks": len(dual),
+                "span_sec": dual[-1]["epoch"] - dual[0]["epoch"] if len(dual) > 1 else 0,
+                "span_human": common.format_duration(
+                    dual[-1]["epoch"] - dual[0]["epoch"] if len(dual) > 1 else 0
+                ),
+                "meets_24h": len(dual) > 1 and dual[-1]["epoch"] - dual[0]["epoch"] >= 86400,
+            },
+        }
     else:
-        report["aggregated"] = False
+        report["mode"] = "onchain_ref"
+        aggregated = basis_series(conn, pair, start, end, source)
+        if aggregated:
+            report.update(
+                _summarize_basis_series(
+                    aggregated,
+                    held_bps=held_bps,
+                    edge_bps=edge_bps,
+                    floor_bps=floor_bps,
+                    min_ticks=min_ticks,
+                )
+            )
+            report["aggregated"] = True
+        else:
+            report["aggregated"] = False
 
     for dex in pool_dexes(conn, pair, start, end):
         pool_series = pool_basis_series(conn, pair, dex, start, end)
         if pool_series:
             report["pools"][dex] = _summarize_basis_series(
-                pool_series, held_bps=held_bps, edge_bps=edge_bps, min_ticks=min_ticks
+                pool_series,
+                held_bps=held_bps,
+                edge_bps=edge_bps,
+                floor_bps=floor_bps,
+                min_ticks=min_ticks,
             )
 
     cross = cross_pool_series(conn, pair, start, end)
@@ -1332,7 +1497,7 @@ def basis_report(
             },
         }
 
-    if not aggregated and not report["pools"]:
+    if not report.get("aggregated") and not report["pools"]:
         report["status"] = "no paired CEX/on-chain ticks in window"
     return report
 
@@ -1341,22 +1506,37 @@ def _render_basis_leg(name: str, leg: dict, thresholds: dict) -> list[str]:
     lines: list[str] = []
     last = leg["last"]
     stats = leg["stats"]
-    mid_text = price_fmt(last["mid"]) if last.get("mid") is not None else "-"
+    cex_mid = last.get("cex_mid", last.get("mid"))
+    dex_mid = last.get("dex_mid", last.get("onchain_ref"))
+    cex_text = price_fmt(cex_mid) if cex_mid is not None else "-"
+    dex_text = price_fmt(dex_mid) if dex_mid is not None else "-"
     lines.append(
         f"  {name:<10} basis {last['basis_bps']:+.2f} bps  "
-        f"(cex {mid_text} vs pool {price_fmt(last['onchain_ref'])})"
+        f"(cex {cex_text} vs dex {dex_text})"
     )
+    interval = leg.get("median_tick_sec")
+    interval_text = f"  median {interval:.0f}s/tick" if interval is not None else ""
     lines.append(
         f"             {leg['ticks']} ticks  mean {stats['mean_bps']:+.2f} bps  "
-        f"range {stats['min_bps']:+.2f}..{stats['max_bps']:+.2f}"
+        f"range {stats['min_bps']:+.2f}..{stats['max_bps']:+.2f}{interval_text}"
     )
     held = leg["held_periods"]
     edge = leg["edge_periods"]
+    episodes = leg.get("episodes", edge)
     lines.append(
         f"             held {len(held)} ({leg['held_ticks_pct']}%)  "
         f"edge {len(edge)} ({leg['edge_ticks_pct']}%)  "
         f"(|basis|<={thresholds['held_bps']:.0f} / >={thresholds['edge_bps']:.0f} bps)"
     )
+    lines.append(
+        f"             episodes {len(episodes)} ({leg.get('episode_ticks_pct', 0)}%)  "
+        f"(|basis|>={thresholds['floor_bps']:.0f} bps, min {thresholds['min_ticks']} ticks)"
+    )
+    for episode in episodes[:3]:
+        lines.append(
+            f"               {common.format_duration(episode['duration_sec'])}  "
+            f"{episode['ticks']} ticks  mean {episode['mean_bps']:+.2f} bps"
+        )
     return lines
 
 
@@ -1366,12 +1546,30 @@ def render_basis(reports: list[dict]) -> str:
         if report.get("status") and not report.get("pools"):
             lines.append(f"{report['pair']}@{report['source']}: {report['status']}")
             continue
-        label = f"{report['pair']}@{report['source']}"
+        if report.get("mode") == "dual_venue":
+            label = f"{report['pair']}  {report['source']}+{report['dex_source']}"
+        else:
+            label = f"{report['pair']}@{report['source']}"
         thresholds = report["thresholds"]
         lines.append(f"=== {label} ===")
 
+        coverage = report.get("coverage")
+        if coverage:
+            cex = coverage["cex"]
+            dex = coverage["dex"]
+            paired = coverage["paired"]
+            lines.append(
+                f"  coverage   cex {cex['span_human']} ({cex['ticks']} ticks"
+                f"{', >=24h' if cex['meets_24h'] else ''})  "
+                f"dex {dex['span_human']} ({dex['ticks']} ticks"
+                f"{', >=24h' if dex['meets_24h'] else ''})  "
+                f"paired {paired['span_human']} ({paired['ticks']} ticks"
+                f"{', >=24h' if paired['meets_24h'] else ''})"
+            )
+
         if report.get("aggregated") and "last" in report:
-            lines.extend(_render_basis_leg("aggregated", report, thresholds))
+            leg_name = "dual_venue" if report.get("mode") == "dual_venue" else "aggregated"
+            lines.extend(_render_basis_leg(leg_name, report, thresholds))
 
         cross = report.get("cross_pool")
         if cross:
@@ -1393,10 +1591,10 @@ def render_basis(reports: list[dict]) -> str:
         lines.append("")
 
     if any(not report.get("status") or report.get("pools") for report in reports):
-        lines.append("Basis is (cex_mid - pool_ref) / pool_ref per leg. Per-pool refs come from")
-        lines.append("parallel Jupiter quotes (JUPITER_DEXES) on the same tick as the CEX book.")
-        lines.append("Cross-pool spread is best_sell_pool minus best_buy_pool. No fees, latency or")
-        lines.append("execution path are counted — dry measurement for eyes, not send.")
+        lines.append("Basis is (cex_mid - dex_mid) / dex_mid * 1e4 per joined tick (ts_epoch).")
+        lines.append("Dual-venue mode joins binance + jupiter source rows; legacy mode uses onchain_ref.")
+        lines.append("Episode duration follows actual tick spacing (1s when INTERVAL_SEC=1), not 30s buckets.")
+        lines.append("No fees, latency or execution path are counted — measurement for eyes, not send.")
     return "\n".join(lines).rstrip()
 
 
@@ -1468,6 +1666,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="minimum consecutive ticks to count a held/edge period (default: 3)",
+    )
+    parser.add_argument(
+        "--floor-bps",
+        type=float,
+        default=None,
+        help="|basis| at or above this for consecutive ticks counts as an episode (default: --edge-bps)",
     )
     return parser
 
@@ -1563,12 +1767,13 @@ def main(argv: list[str] | None = None) -> int:
             keys = basis_keys(conn, args.pairs, args.venue)
             if not keys:
                 print(
-                    "no on-chain reference recorded yet - enable JUPITER_ENABLED=1 (and "
-                    "optionally JUPITER_DEXES=Raydium,Orca,Meteora DLMM) in the recorder "
-                    ".env and record for a while",
+                    "no basis data recorded yet - add WATCHLIST_JUPITER=SOLUSDC:SOLUSDT alongside "
+                    "WATCHLIST (binance) with INTERVAL_SEC=1, or enable JUPITER_ENABLED=1 in the "
+                    "recorder .env and record for a while",
                     file=sys.stderr,
                 )
                 return 1
+            floor_bps = args.edge_bps if args.floor_bps is None else args.floor_bps
             reports = [
                 basis_report(
                     conn,
@@ -1578,6 +1783,7 @@ def main(argv: list[str] | None = None) -> int:
                     source,
                     held_bps=args.held_bps,
                     edge_bps=args.edge_bps,
+                    floor_bps=floor_bps,
                     min_ticks=args.basis_min_ticks,
                 )
                 for pair, source in keys
@@ -1585,7 +1791,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.format == "json":
                 print(json.dumps({"basis": reports}, indent=2))
             else:
-                print("oakring basis  |  CEX mid vs Jupiter on-chain reference")
+                print("oakring basis  |  CEX mid vs Jupiter (dual-venue join on ts_epoch)")
                 print(render_basis(reports))
                 print("")
             return 0
