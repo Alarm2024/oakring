@@ -64,7 +64,8 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 | `MAX_RETRIES` | `2` | Retries per tick, exponential backoff, then a per-pair fallback |
 | `RETENTION_DAYS` | `0` (keep all) | Prune ticks older than this, checked hourly |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
-| `JUPITER_ENABLED` | off | Set `1` to sample a Jupiter quote on each tick |
+| `WATCHLIST_JUPITER` | unset | Jupiter as a second venue, e.g. `SOLUSDC:SOLUSDT` for dual-venue basis vs binance |
+| `JUPITER_ENABLED` | off | Set `1` to sample a Jupiter quote on each tick (legacy attach mode) |
 | `JUPITER_ATTACH_PAIRS` | `SOLUSDT,SOLUSDC` | CEX pairs that receive `onchain_ref` / `basis_bps` columns |
 | `JUPITER_DEXES` | unset | Comma-separated DEX labels for per-pool samples (e.g. `Raydium,Orca,Meteora DLMM`) |
 | `JUPITER_ONLY_DIRECT_ROUTES` | `1` | Single-hop routes when sampling each DEX |
@@ -101,6 +102,7 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 | `--held-bps` | `15` | \|basis\| at or below this for `--basis-min-ticks` counts as held |
 | `--edge-bps` | `40` | \|basis\| at or above this for `--basis-min-ticks` counts as edge |
 | `--basis-min-ticks` | `3` | Minimum consecutive ticks for a held or edge period |
+| `--floor-bps` | `--edge-bps` | `\|basis\|` at or above this for `--basis-min-ticks` counts as an episode |
 | `--venues` | off | Compare each pair across the venues recording it, then exit |
 | `--venue` | all | Restrict any command to one venue |
 | `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
@@ -323,7 +325,22 @@ The percentage is the useful number over time: a pair whose residual sits inside
 
 ## CEX vs on-chain basis (Jupiter)
 
-Optional dry measurement: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter public quotes on each tick and stores them next to the CEX book on the configured pairs (`JUPITER_ATTACH_PAIRS`, default `SOLUSDT,SOLUSDC`). Both legs share the same timestamp, so basis is available at tick resolution — typically one sample per `INTERVAL_SEC` tick when quotes succeed (sequential DEX fetches and retries can push the effective cadence above `INTERVAL_SEC`; failed ticks are skipped gracefully), instead of the ~30s journal samples elsewhere. CEX mids used for per-pool basis are keyed by pair name only (Binance-only today).
+Continuous dual-venue basis joins Binance and Jupiter as independent `source` rows on the same `ts_epoch`. Set `WATCHLIST_JUPITER` alongside `WATCHLIST` (binance) and use `INTERVAL_SEC=1` for 1-second episode resolution — episode duration follows actual tick spacing, not 30-second buckets.
+
+```bash
+# in ~/.config/oakring/.env
+WATCHLIST=SOLUSDC,SOLUSDT
+WATCHLIST_JUPITER=SOLUSDC:SOLUSDT
+INTERVAL_SEC=1
+
+# after 24h+ of recording:
+python3 analyze.py --basis --since 24h --floor-bps 25
+python3 analyze.py --basis --since 24h --format json
+```
+
+`--basis` joins `binance.mid` (cex) with `jupiter.mid` (dex) per tick: `(cex_mid - dex_mid) / dex_mid * 1e4`. The report includes distribution stats, episodes where `|basis|` exceeds `--floor-bps` (default: `--edge-bps`), and per-source coverage flags for whether each leg spans ≥24h.
+
+Legacy attach mode still works: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter public quotes on each tick and stores them next to the CEX book on the configured pairs (`JUPITER_ATTACH_PAIRS`, default `SOLUSDT,SOLUSDC`). Both legs share the same timestamp, so basis is available at tick resolution — typically one sample per `INTERVAL_SEC` tick when quotes succeed (sequential DEX fetches and retries can push the effective cadence above `INTERVAL_SEC`; failed ticks are skipped gracefully), instead of the ~30s journal samples elsewhere. CEX mids used for per-pool basis are keyed by pair name only (Binance-only today).
 
 Two layers are recorded:
 
