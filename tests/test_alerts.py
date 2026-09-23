@@ -93,8 +93,55 @@ class HealthTests(TempConfigCase):
         self.seed(stale_pair="ETHUSDT", pairs=("SOLUSDT", "ETHUSDT"))
         report = health.health(self.db_path, stale_after=300)
         self.assertFalse(report["ok"])
-        self.assertEqual(report["stalled_pairs"], ["ETHUSDT"])
+        self.assertEqual(report["stalled_pairs"], ["ETHUSDT@binance"])
         self.assertIn("ETHUSDT", health.summarise(report))
+
+    def test_dead_venue_is_not_masked_by_a_live_one_on_the_same_pair(self) -> None:
+        """A live venue must not vouch for a dead one on the same pair.
+
+        Grouping staleness by pair alone made MAX(ts) for the pair seconds old
+        while one of its venues had been silent for days, so the verdict stayed
+        green. This is that case, and it must come back red.
+        """
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        rows = []
+        for offset in range(30, 630, 60):  # both venues ticking, current
+            epoch = now - offset
+            ts = common.to_ts_utc(common.from_epoch(epoch))
+            for source in ("binance", "coinbase"):
+                rows.append((ts, epoch, "SOLUSDC", source, 118.1, 118.2, 118.15,
+                             1.0, 1.0, 1.0, None))
+        dead = now - 7 * 86400  # third venue, same pair, silent for a week
+        rows.append((common.to_ts_utc(common.from_epoch(dead)), dead, "SOLUSDC",
+                     "bybit", 99.1, 99.2, 99.15, 3.0, 1.0, 1.0, None))
+        recorder.insert_rows(conn, rows)
+        conn.close()
+
+        report = health.health(self.db_path, stale_after=300)
+        self.assertFalse(report["ok"], "a week-dead venue must not report OK")
+        self.assertEqual(report["stalled_pairs"], ["SOLUSDC@bybit"])
+        self.assertEqual(report["pairs"], 1)
+        self.assertEqual(report["series"], 3)
+
+    def test_every_venue_live_stays_green(self) -> None:
+        """The negative: several venues on one pair, all current, is healthy."""
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        rows = []
+        for offset in range(30, 630, 60):
+            epoch = now - offset
+            ts = common.to_ts_utc(common.from_epoch(epoch))
+            for source in ("binance", "coinbase", "kraken"):
+                rows.append((ts, epoch, "SOLUSDC", source, 118.1, 118.2, 118.15,
+                             1.0, 1.0, 1.0, None))
+        recorder.insert_rows(conn, rows)
+        conn.close()
+
+        report = health.health(self.db_path, stale_after=300)
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertEqual(report["stalled_pairs"], [])
+        self.assertEqual(report["series"], 3)
 
     def test_sustained_errors(self) -> None:
         self.seed(errors=9)  # 9 of 10 rounds failed
