@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    report = health.health(db_path, stale_after)
+    report = health.health(db_path, stale_after, health.expected_series(env))
     repeat_sec = common.env_int(env, "ALERT_REPEAT_HOURS", DEFAULT_REPEAT_HOURS, minimum=0) * 3600
     state = load_state()
     now = time.time()
