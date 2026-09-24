@@ -7,6 +7,7 @@ Stdlib only. Safe to run while the recorder is writing (opens read-only).
     python3 analyze.py --pair SOLUSDT --since 30d --bucket 4h --swing 3
     python3 analyze.py --format json --since 24h --bucket 15m > report.json
     python3 analyze.py --basis --since 12h --held-bps 15 --edge-bps 40
+    python3 analyze.py --follow --since 7d --cost-bps 30
 
 What it reports per pair:
   * coverage    - how much of the window was actually recorded, and the gaps
@@ -32,6 +33,7 @@ import common
 MIN_BARS_FOR_STATS = 5
 TARGET_BARS = 150  # what --auto aims for: enough to see a cycle, few enough to stay readable
 BUCKET_LADDER = (60, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400)
+MIN_FOLLOW_TICKS = 100  # fewer simultaneous ticks than this are INSUFFICIENT for ranking
 
 # Legacy rows written before ts_epoch existed still carry a usable ts_utc.
 EPOCH_SQL = "COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER))"
@@ -518,6 +520,296 @@ def render_venues(reports: list[dict]) -> str:
         lines.append("cost and transfer time all sit between the two sides, and none are")
         lines.append("counted here. This measures how far the venues disagree, nothing more.")
     return "\n".join(lines)
+
+
+FOLLOW_COST_CAVEAT = (
+    "A crossed book across venues is not free money: taker fees, withdrawal cost and "
+    "transfer time all sit between the two sides, and none are counted here. A crossed "
+    "book at time T is not a fill at time T. This ranks where to look, not what to earn."
+)
+
+
+def venue_pair_series(
+    conn, pair: str, venue_a: str, venue_b: str, start: int, end: int
+) -> list[dict]:
+    """Simultaneous ticks for one pair on two venues, with the mid-to-mid gap."""
+    rows = conn.execute(
+        f"""
+        SELECT {EPOCH_SQL} AS epoch, source, mid
+        FROM ticks
+        WHERE pair = ? AND source IN (?, ?) AND note IS NULL AND mid IS NOT NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        ORDER BY epoch
+        """,
+        (pair, venue_a, venue_b, start, end),
+    ).fetchall()
+
+    by_epoch: dict[int, dict[str, float]] = {}
+    for row in rows:
+        by_epoch.setdefault(int(row["epoch"]), {})[row["source"]] = float(row["mid"])
+
+    series: list[dict] = []
+    for epoch in sorted(by_epoch):
+        mids = by_epoch[epoch]
+        if venue_a not in mids or venue_b not in mids:
+            continue
+        mid_a, mid_b = mids[venue_a], mids[venue_b]
+        reference = statistics.fmean((mid_a, mid_b))
+        if reference <= 0:
+            continue
+        gap_bps = abs(mid_a - mid_b) / reference * 10000.0
+        series.append({
+            "epoch": epoch,
+            "hour_utc": common.from_epoch(epoch).hour,
+            "gap_bps": gap_bps,
+        })
+    return series
+
+
+def pair_recording_rounds(conn, pair: str, start: int, end: int) -> int:
+    """Distinct tick epochs for this pair in the window (any venue)."""
+    row = conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT {EPOCH_SQL}) AS rounds
+        FROM ticks
+        WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
+          AND {EPOCH_SQL} BETWEEN ? AND ?
+        """,
+        (pair, start, end),
+    ).fetchone()
+    return int(row["rounds"] or 0)
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * pct / 100.0
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return ordered[int(rank)]
+    weight = rank - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _run_lengths_above(gaps: list[float], floor_bps: float) -> list[int]:
+    runs: list[int] = []
+    current = 0
+    for gap in gaps:
+        if gap >= floor_bps:
+            current += 1
+        elif current:
+            runs.append(current)
+            current = 0
+    if current:
+        runs.append(current)
+    return runs
+
+
+def _summarize_gap_series(gaps: list[float], cost_bps: float) -> dict:
+    above = [gap for gap in gaps if gap >= cost_bps]
+    runs = _run_lengths_above(gaps, cost_bps)
+    fraction_above = len(above) / len(gaps)
+    median_run = statistics.median(runs) if runs else 0.0
+    return {
+        "ticks": len(gaps),
+        "median_bps": round(statistics.median(gaps), 2),
+        "p90_bps": round(_percentile(gaps, 90), 2),
+        "p99_bps": round(_percentile(gaps, 99), 2),
+        "max_bps": round(max(gaps), 2),
+        "above_floor_ticks": len(above),
+        "above_floor_pct": round(100.0 * fraction_above, 2),
+        "above_floor_fraction": fraction_above,
+        "median_run_ticks": round(float(median_run), 2),
+        "run_count": len(runs),
+        "score": round(fraction_above * median_run, 4),
+        "clears_floor": bool(above),
+    }
+
+
+def _hour_buckets(series: list[dict], cost_bps: float) -> list[dict]:
+    by_hour: dict[int, list[float]] = {hour: [] for hour in range(24)}
+    for point in series:
+        by_hour[point["hour_utc"]].append(point["gap_bps"])
+
+    buckets: list[dict] = []
+    for hour in range(24):
+        gaps = by_hour[hour]
+        if not gaps:
+            continue
+        summary = _summarize_gap_series(gaps, cost_bps)
+        buckets.append({"hour_utc": hour, **summary})
+    return buckets
+
+
+def follow_venue_pair_report(
+    conn,
+    pair: str,
+    venue_a: str,
+    venue_b: str,
+    start: int,
+    end: int,
+    cost_bps: float,
+) -> dict:
+    series = venue_pair_series(conn, pair, venue_a, venue_b, start, end)
+    expected_rounds = pair_recording_rounds(conn, pair, start, end)
+    if not series:
+        return {
+            "pair": pair,
+            "venue_a": venue_a,
+            "venue_b": venue_b,
+            "status": "no simultaneous ticks in window",
+        }
+
+    gaps = [point["gap_bps"] for point in series]
+    summary = _summarize_gap_series(gaps, cost_bps)
+    coverage_pct = round(100.0 * len(series) / max(1, expected_rounds), 1)
+    span_sec = series[-1]["epoch"] - series[0]["epoch"]
+    insufficient = len(series) < MIN_FOLLOW_TICKS
+
+    return {
+        "pair": pair,
+        "venue_a": venue_a,
+        "venue_b": venue_b,
+        "cost_bps": cost_bps,
+        "status": "INSUFFICIENT" if insufficient else "ok",
+        "span_sec": span_sec,
+        "span_human": common.format_duration(span_sec),
+        "expected_rounds": expected_rounds,
+        "coverage_pct": coverage_pct,
+        "hours": _hour_buckets(series, cost_bps),
+        **summary,
+    }
+
+
+def follow_report(
+    conn,
+    start: int,
+    end: int,
+    cost_bps: float,
+    wanted_pairs: list[str] | None = None,
+) -> dict:
+    pairs = sorted({pair for pair, _ in recorded_keys(conn, wanted_pairs)})
+    multi = [
+        pair for pair in pairs
+        if len({source for _, source in recorded_keys(conn, [pair])}) > 1
+    ]
+    reports: list[dict] = []
+    for pair in multi:
+        venues = sorted({source for _, source in recorded_keys(conn, [pair])})
+        for index, venue_a in enumerate(venues):
+            for venue_b in venues[index + 1 :]:
+                reports.append(
+                    follow_venue_pair_report(conn, pair, venue_a, venue_b, start, end, cost_bps)
+                )
+
+    eligible = [
+        report for report in reports
+        if report.get("status") == "ok" and report.get("clears_floor")
+    ]
+    ranked = sorted(eligible, key=lambda report: report["score"], reverse=True)
+    for rank, report in enumerate(ranked, start=1):
+        report["rank"] = rank
+
+    return {
+        "window": {
+            "start_epoch": start,
+            "end_epoch": end,
+            "start": common.to_ts_utc(common.from_epoch(start)),
+            "end": common.to_ts_utc(common.from_epoch(end)),
+            "length": common.format_duration(end - start),
+        },
+        "cost_bps": cost_bps,
+        "min_ticks": MIN_FOLLOW_TICKS,
+        "venue_pairs": reports,
+        "ranking": ranked,
+        "any_clears_floor": bool(eligible),
+    }
+
+
+def render_follow(report: dict) -> str:
+    lines: list[str] = []
+    window = report["window"]
+    cost_bps = report["cost_bps"]
+    lines.append(
+        f"window {window['start']} -> {window['end']}  "
+        f"({window['length']})  cost floor {cost_bps:.2f} bps  "
+        f"min ticks {report['min_ticks']}"
+    )
+    lines.append("")
+
+    if not report["venue_pairs"]:
+        lines.append("no pair is recorded on more than one venue")
+        return "\n".join(lines)
+
+    insufficient = [row for row in report["venue_pairs"] if row.get("status") == "INSUFFICIENT"]
+    empty = [row for row in report["venue_pairs"] if row.get("status") not in ("ok", "INSUFFICIENT")]
+
+    if not report["any_clears_floor"]:
+        lines.append(
+            f"nothing cleared the {cost_bps:.2f} bps floor in this window — ranking nothing."
+        )
+    else:
+        lines.append(
+            f"{'rank':>4}  {'pair':<10} {'venues':<22} {'ticks':>6} {'cov%':>6} "
+            f"{'median':>7} {'p90':>7} {'p99':>7} {'max':>7} "
+            f"{'above%':>7} {'med_run':>8} {'score':>8}"
+        )
+        for row in report["ranking"]:
+            venues = f"{row['venue_a']} vs {row['venue_b']}"
+            lines.append(
+                f"{row['rank']:>4}  {row['pair']:<10} {venues:<22} {row['ticks']:>6} "
+                f"{row['coverage_pct']:>5.1f}% {row['median_bps']:>7.2f} {row['p90_bps']:>7.2f} "
+                f"{row['p99_bps']:>7.2f} {row['max_bps']:>7.2f} "
+                f"{row['above_floor_pct']:>6.2f}% {row['median_run_ticks']:>8.2f} "
+                f"{row['score']:>8.4f}"
+            )
+        lines.append("")
+        for row in report["ranking"]:
+            lines.append(
+                f"--- rank {row['rank']}: {row['pair']}  {row['venue_a']} vs {row['venue_b']}  "
+                f"score {row['score']:.4f} ---"
+            )
+            lines.append(
+                f"  ticks {row['ticks']}  coverage {row['coverage_pct']:.1f}%  "
+                f"span {row['span_human']}"
+            )
+            lines.append(
+                f"  gap bps  median {row['median_bps']:.2f}  p90 {row['p90_bps']:.2f}  "
+                f"p99 {row['p99_bps']:.2f}  max {row['max_bps']:.2f}"
+            )
+            lines.append(
+                f"  above {cost_bps:.2f} bps floor: {row['above_floor_pct']:.2f}% of ticks  "
+                f"median run {row['median_run_ticks']:.2f} ticks  "
+                f"({row['run_count']} runs)"
+            )
+            if row["hours"]:
+                lines.append("  by hour UTC:")
+                for hour in row["hours"]:
+                    lines.append(
+                        f"    {hour['hour_utc']:02d}  ticks {hour['ticks']:>5}  "
+                        f"median {hour['median_bps']:>6.2f}  above {hour['above_floor_pct']:>6.2f}%  "
+                        f"med_run {hour['median_run_ticks']:>5.2f}"
+                    )
+            lines.append("")
+
+    if insufficient:
+        lines.append(f"INSUFFICIENT (< {report['min_ticks']} simultaneous ticks):")
+        for row in insufficient:
+            lines.append(
+                f"  {row['pair']}  {row['venue_a']} vs {row['venue_b']}  "
+                f"{row.get('ticks', 0)} ticks  coverage {row.get('coverage_pct', 0.0):.1f}%"
+            )
+        lines.append("")
+
+    for row in empty:
+        lines.append(f"{row['pair']}  {row['venue_a']} vs {row['venue_b']}: {row['status']}")
+
+    lines.append(FOLLOW_COST_CAVEAT)
+    return "\n".join(lines).rstrip()
 
 
 def load_bars(conn, pair: str, start: int, end: int, bucket: int, source: str | None = None) -> list[Bar]:
@@ -1432,6 +1724,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="compare each pair's book across the venues recording it, and exit",
     )
     parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="rank venue-pair dislocations that clear --cost-bps often and persistently, then exit",
+    )
+    parser.add_argument(
+        "--cost-bps",
+        type=float,
+        default=None,
+        help="required with --follow: your all-in cost floor in bps (no default — you must state it)",
+    )
+    parser.add_argument(
         "--cross",
         action="store_true",
         help=f"compare each asset's USDT and USDC books against {PEG_PAIR}, and exit",
@@ -1522,6 +1825,45 @@ def main(argv: list[str] | None = None) -> int:
                 print(render_venues(reports))
                 print("")
             return 0
+
+        if args.follow:
+            if args.cost_bps is None:
+                print("--follow requires --cost-bps (no default — state what you think it costs)", file=sys.stderr)
+                return 2
+            if args.cost_bps < 0:
+                print("--cost-bps must be >= 0", file=sys.stderr)
+                return 2
+            try:
+                since_sec = common.parse_duration(args.since)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            end_epoch = common.to_epoch(common.now_utc())
+            start_epoch = end_epoch - since_sec
+            pairs = sorted({pair for pair, _ in recorded_keys(conn, args.pairs)})
+            multi = [
+                pair for pair in pairs
+                if len({source for _, source in recorded_keys(conn, [pair])}) > 1
+            ]
+            if not multi:
+                print(
+                    "no pair is recorded on more than one venue - add e.g. "
+                    "WATCHLIST_COINBASE=SOLUSDC to the .env file",
+                    file=sys.stderr,
+                )
+                return 1
+            report = follow_report(conn, start_epoch, end_epoch, args.cost_bps, args.pairs)
+            if args.format == "json":
+                print(json.dumps({"follow": report}, indent=2))
+            else:
+                print("oakring follow  |  venue-pair dislocation vs your cost floor")
+                print(render_follow(report))
+                print("")
+            return 0
+
+        if args.cost_bps is not None:
+            print("--cost-bps is only used with --follow", file=sys.stderr)
+            return 2
 
         if args.cross:
             try:
