@@ -159,8 +159,9 @@ def watchlists_from(env: dict[str, str]) -> dict[str, dict[str, str]]:
     """Which pairs to record on which venue, and what each venue calls them.
 
     WATCHLIST is binance, unchanged. Any other venue is turned on by giving it
-    its own list, e.g. WATCHLIST_COINBASE=SOLUSDC:SOLUSD - a venue with no list
-    is simply not polled.
+    its own list, e.g. WATCHLIST_COINBASE=SOLUSDC:SOLUSD or
+    WATCHLIST_JUPITER=SOLUSDC:SOLUSDT for dual-venue CEX/DEX basis. A venue
+    with no list is simply not polled.
     """
     watchlists: dict[str, dict[str, str]] = {
         "binance": {pair: pair for pair in watchlist_from(env)}
