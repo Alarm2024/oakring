@@ -143,6 +143,74 @@ class HealthTests(TempConfigCase):
         self.assertEqual(report["stalled_pairs"], [])
         self.assertEqual(report["series"], 3)
 
+    def _two_live_one_old_bybit(self, bybit_note=None, bybit_recent=False) -> None:
+        conn = common.connect(self.db_path)
+        now = common.to_epoch(common.now_utc())
+        rows = []
+        for offset in range(30, 630, 60):
+            epoch = now - offset
+            ts = common.to_ts_utc(common.from_epoch(epoch))
+            for source in ("binance", "coinbase"):
+                rows.append((ts, epoch, "SOLUSDC", source, 118.1, 118.2, 118.15, 1.0, 1.0, 1.0, None))
+            if bybit_recent:
+                rows.append((ts, epoch, "SOLUSDC", "bybit", None, None, None, None, None, None, bybit_note))
+        dead = now - 8 * 86400
+        rows.append((common.to_ts_utc(common.from_epoch(dead)), dead, "SOLUSDC",
+                     "bybit", 99.1, 99.2, 99.15, 3.0, 1.0, 1.0, None))
+        recorder.insert_rows(conn, rows)
+        conn.close()
+
+    def test_a_venue_switched_off_is_retired_not_an_outage(self) -> None:
+        """SOLUSDC@bybit, 24 Sep: gone from the watchlist, alerting every 6h.
+
+        The recorder writes a row for every configured series on every tick,
+        failed or not, so a series with no recent row that is also not in the
+        watchlist was switched off. That is not an outage.
+        """
+        self._two_live_one_old_bybit()
+        expected = {"SOLUSDC@binance", "SOLUSDC@coinbase"}
+        report = health.health(self.db_path, stale_after=300, expected=expected)
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertEqual(report["stalled_pairs"], [])
+        self.assertEqual(len(report["retired_series"]), 1)
+        self.assertIn("SOLUSDC@bybit", report["retired_series"][0])
+        self.assertIn("retired", health.render(report))
+
+    def test_a_configured_venue_gone_quiet_says_restart(self) -> None:
+        self._two_live_one_old_bybit()
+        expected = {"SOLUSDC@binance", "SOLUSDC@coinbase", "SOLUSDC@bybit"}
+        report = health.health(self.db_path, stale_after=300, expected=expected)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["stalled_pairs"], ["SOLUSDC@bybit"])
+        self.assertIn("restart oakring", report["problems"][0])
+
+    def test_configured_but_never_recorded(self) -> None:
+        self._two_live_one_old_bybit()
+        expected = {"SOLUSDC@binance", "SOLUSDC@coinbase", "SOLUSDC@kraken"}
+        report = health.health(self.db_path, stale_after=300, expected=expected)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["never_recorded"], ["SOLUSDC@kraken"])
+
+    def test_a_venue_failing_every_tick_is_named(self) -> None:
+        """Error rows count as ticks, so a venue that fails every time never
+        looked stalled, and one of three is a 33% error rate -- under the 50%
+        bar. It must still be named, with the error it keeps getting."""
+        self._two_live_one_old_bybit(bybit_note="error:HTTPError:403: Forbidden", bybit_recent=True)
+        expected = {"SOLUSDC@binance", "SOLUSDC@coinbase", "SOLUSDC@bybit"}
+        report = health.health(self.db_path, stale_after=300, expected=expected)
+        self.assertFalse(report["ok"])
+        self.assertLess(report["error_rate_1h_pct"], 50.0)
+        self.assertEqual(len(report["failing_series"]), 1)
+        self.assertIn("SOLUSDC@bybit", report["failing_series"][0])
+        self.assertIn("403", report["failing_series"][0])
+
+    def test_expected_series_reads_the_watchlists(self) -> None:
+        env = {"WATCHLIST": "SOLUSDC", "WATCHLIST_COINBASE": "SOLUSDC:SOLUSD", "WATCHLIST_OKX": "SOLUSDC"}
+        self.assertEqual(
+            health.expected_series(env),
+            {"SOLUSDC@binance", "SOLUSDC@coinbase", "SOLUSDC@okx"},
+        )
+
     def test_sustained_errors(self) -> None:
         self.seed(errors=9)  # 9 of 10 rounds failed
         report = health.health(self.db_path)

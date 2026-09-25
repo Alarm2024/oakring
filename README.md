@@ -208,6 +208,12 @@ No laptop needed — both are one line over SSH.
 
 Services, database size, free disk, tick count, how long ago the last tick landed, the error rate over the last hour, any pair that has stalled, and the current prices. Ends in `OK - recording.` or `NEEDS ATTENTION`, and exits non-zero in the second case so cron can use it too.
 
+Staleness is judged per venue against the watchlists in `.env`. The recorder writes a row for every configured pair on every venue on every tick — a failed fetch too — so:
+
+- a watched series with no recent row means the running recorder is not using the current `.env`: restart `oakring`;
+- a watched series whose recent rows all failed is named with its last error, even when the overall error rate looks fine;
+- a series in the database that is no longer in any watchlist is listed as **retired** and does not alert. Removing a venue is not an outage.
+
 **The report, phone sized:**
 
 ```bash
