@@ -543,9 +543,12 @@ python3 -m unittest discover -s tests -v
 | `alert.py` | Notifies Telegram/Discord/webhook when recording breaks |
 | `analyze.py` | Cycle report: bars, coverage, trend, swings, periodogram, phase |
 | `common.py` | Shared config, database open/migrate, time helpers |
-| `schema.sql` | `ticks` table and indexes |
+| `schema.sql` | `ticks` and `pool_samples` tables and indexes |
 | `tests/test_oakring.py` | Offline test suite |
 | `tests/test_jupiter.py` | Jupiter quote parsing, recorder attach, `--basis` analysis |
+| `tests/test_venues.py` | Venue parsers, symbol spellings, multi-venue recording |
+| `tests/test_alerts.py` | Health checks, alert state machine and transports |
+| `tests/test_follow.py` | `--follow` venue-pair dislocation ranking |
 | `tests/fixtures/jupiter_quote_*.json` | Sample Jupiter `/v6/quote` responses (aggregated + per-DEX) |
 | `.env.example` | Sample configuration (copy to `~/.config/oakring/.env`) |
 | `oakring.service` | Hardened systemd unit template |
