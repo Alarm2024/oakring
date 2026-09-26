@@ -3,7 +3,7 @@
 
 Fetches swap quotes for a configured mint pair and turns them into implied mid
 prices (output per one unit of input). Supports one aggregated quote plus
-parallel per-DEX quotes when JUPITER_DEXES is set. No API key is required for
+per-DEX quotes (fetched one at a time) when JUPITER_DEXES is set. No API key is required for
 the public endpoint; set JUPITER_API_KEY in the environment when needed.
 """
 
@@ -260,7 +260,7 @@ def fetch_pool_samples_for_pair(
     *,
     http_get: object | None = None,
 ) -> list[PoolSample]:
-    """Parallel per-DEX quotes for one attached CEX pair."""
+    """Per-DEX quotes for one attached CEX pair, fetched one at a time."""
     dexes = jupiter_cfg.get("dexes") or []
     if not dexes:
         return []
