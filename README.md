@@ -155,7 +155,7 @@ phase      DISTRIBUTION - 68% up the window range, recent -0.47%/day vs +/-1.10%
 
 ### Letting it pick: `--auto`
 
-The settings that matter depend on how much has been recorded and how much the pair moves, and getting them wrong produces a report that says nothing — 4-hour buckets over two days give 13 bars, and a 5% swing threshold never triggers on a pair whose whole range is 2.9%.
+The settings that matter depend on how much has been recorded and how much the pair moves, and getting them wrong produces a report that says nothing — 4-hour buckets over two days give 12 bars, and a 5% swing threshold never triggers on a pair whose whole range is 2.9%.
 
 `--auto` derives both per pair: a bucket that turns the recording into roughly 150 bars, and a swing threshold scaled to that pair's own per-bar movement. Each pair gets its own, which is the point — BTC and SOL do not swing by the same percentage.
 
