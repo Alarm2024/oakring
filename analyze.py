@@ -2025,7 +2025,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("")
                 print(render_brief(report))
             if empty:
-                print(f"\nnothing recorded yet: {', '.join(empty)}")
+                print("\nnothing recorded yet:")
+                for label in empty:
+                    print(f"  {label}")
         else:
             print(f"oakring market cycle report  |  db {db_path}")
             for report in reports:
