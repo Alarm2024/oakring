@@ -74,7 +74,7 @@ This service opens no ports. It runs with no privileges, a read-only view of the
 | `JUPITER_AMOUNT_LAMPORTS` | `1000000000` | Quote size (1 SOL) |
 | `JUPITER_SLIPPAGE_BPS` | `50` | Slippage passed to the quote route finder |
 | `JUPITER_INPUT_DECIMALS` / `JUPITER_OUTPUT_DECIMALS` | `9` / `6` | Decode raw mint amounts into a price |
-| `JUPITER_API_KEY` | unset | Optional; read from env only, never commit |
+| `JUPITER_API_KEY` | unset | Optional; never commit |
 
 ## Analysing the recording
 
