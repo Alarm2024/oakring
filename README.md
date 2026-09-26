@@ -247,7 +247,7 @@ WATCHLIST_KRAKEN=SOLUSDC
 WATCHLIST_OKX=SOLUSDC
 ```
 
-Supported: `binance`, `coinbase`, `kraken`, `okx`, `bybit` — all public endpoints, no keys.
+Supported: `binance`, `coinbase`, `kraken`, `okx`, `bybit` — all public endpoints, no keys. `jupiter` (on-chain quotes via the public API) can be recorded too with `WATCHLIST_JUPITER`, for pairs whose base and quote both have a Solana mint; its quotes are one-sided, so its `spread_bps` records 0 — "not measured", not "infinitely liquid".
 
 Exchanges do not agree on names, and sometimes not on which pairs exist. `PAIR:VENUE_PAIR` records under the first name and asks the venue for the second:
 
@@ -260,19 +260,31 @@ Coinbase lists no `SOL-USDC` at all — USD and USDC are interchangeable there, 
 Check a venue actually carries a pair before adding it:
 
 ```bash
-python3 recorder.py --probe SOLUSDC SOLUSDC:SOLUSD
+python3 recorder.py --probe SOLUSDC
 ```
 
 ```
 venue      pair       result
 binance    SOLUSDC    ok   bid=99.81  ask=99.82  mid=99.815  spread=1.00bps
+bybit      SOLUSDC    ok   bid=99.80  ask=99.82  mid=99.81   spread=2.00bps
 coinbase   SOL-USDC   FAILED  error:HTTPError:404: Not Found
-coinbase   SOL-USD    ok   bid=99.80  ask=99.83  mid=99.815  spread=3.01bps
+jupiter    SOLUSDC    ok   bid=99.82  ask=99.82  mid=99.82   spread=0.00bps
 kraken     SOLUSDC    ok   bid=99.79  ask=99.84  mid=99.815  spread=5.01bps
 okx        SOL-USDC   ok   bid=99.81  ask=99.83  mid=99.82   spread=2.00bps
 ```
 
-The probe prints each venue's own spelling, so a 404 tells you the name is wrong rather than the venue being down.
+The probe prints each venue's own spelling, so a 404 tells you the name is wrong rather than the venue being down. One `PAIR:VENUE_PAIR` mapping replaces the plain name for every venue, so probe the two spellings separately:
+
+```bash
+python3 recorder.py --probe SOLUSDC:SOLUSD
+```
+
+```
+venue      pair       result
+...
+coinbase   SOL-USD    ok   bid=99.80  ask=99.83  mid=99.815  spread=3.01bps
+...
+```
 
 Only add the venues that say `ok`. The probe writes nothing.
 
