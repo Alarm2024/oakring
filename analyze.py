@@ -1686,7 +1686,7 @@ def render_basis(reports: list[dict]) -> str:
 
     if any(not report.get("status") or report.get("pools") for report in reports):
         lines.append("Basis is (cex_mid - pool_ref) / pool_ref per leg. Per-pool refs come from")
-        lines.append("parallel Jupiter quotes (JUPITER_DEXES) on the same tick as the CEX book.")
+        lines.append("per-DEX Jupiter quotes (JUPITER_DEXES) on the same tick as the CEX book.")
         lines.append("Cross-pool spread is best_sell_pool minus best_buy_pool. No fees, latency or")
         lines.append("execution path are counted — dry measurement for eyes, not send.")
     return "\n".join(lines).rstrip()
