@@ -302,7 +302,7 @@ Only ticks where every venue priced are compared, since a fresh book against a m
 
 ### Everything else stays venue-aware
 
-Once a pair is on more than one venue, `--latest` and the cycle reports label it `SOLUSDC@kraken` and analyse each venue separately — two venues' books folding into one series would be meaningless. `--venue kraken` restricts any command to one venue and drops the suffix.
+Once the database holds more than one venue, `--latest` and the cycle reports label every series `pair@venue` (`SOLUSDC@kraken`) and analyse each venue separately — two venues' books folding into one series would be meaningless. `--venue kraken` restricts any command to one venue and drops the suffix.
 
 ## The USDT / USDC cross
 
