@@ -428,7 +428,7 @@ def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
     series = []
     for epoch in sorted(by_epoch):
         books = by_epoch[epoch]
-        if len(books) < 2:
+        if len(books) < len(sources):
             continue  # a venue missed this round; comparing would be misleading
         best_bid_venue = max(books, key=lambda name: books[name]["bid"])
         best_ask_venue = min(books, key=lambda name: books[name]["ask"])
