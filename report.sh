@@ -19,9 +19,9 @@ mkdir -p "$REPORT_DIR"
 chmod 700 "$REPORT_DIR"
 
 case " $* " in
-    *" --format json "*) EXT=json ;;
-    *" --format csv "*)  EXT=csv ;;
-    *)                   EXT=txt ;;
+    *" --format json "*|*" --format=json "*) EXT=json ;;
+    *" --format csv "*|*" --format=csv "*)   EXT=csv ;;
+    *)                                       EXT=txt ;;
 esac
 
 OUT="${REPORT_DIR}/report-$(date -u +%Y-%m-%dT%H%M%SZ).${EXT}"
