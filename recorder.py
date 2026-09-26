@@ -333,10 +333,13 @@ def run_tick(
 
     insert_rows(conn, rows)
 
+    # Keyed by pair name only and Binance-only, matching the analyzer's
+    # per-pool join (and the README): with several venues recording an
+    # attached pair, last-row-wins here would silently mix venues.
     cex_mids = {
         row[2]: row[6]
         for row in rows
-        if row[2] in attach_pairs and row[10] is None and row[6] is not None
+        if row[2] in attach_pairs and row[3] == "binance" and row[10] is None and row[6] is not None
     }
     pool_rows = record_pool_samples(conn, ts, epoch, cex_mids, jupiter_cfg, timeout)
 
