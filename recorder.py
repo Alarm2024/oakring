@@ -408,19 +408,23 @@ def probe(pairs: dict[str, str], timeout: int) -> int:
         venue = venues.get(name)
         for pair, symbol in pairs.items():
             try:
+                display = venue.to_symbol(symbol)
+            except Exception:  # noqa: BLE001 - a venue that cannot spell the pair still gets a row
+                display = symbol
+            try:
                 quote = fetch_venue(venue, {pair: symbol}, timeout).get(pair)
                 if quote is None:
                     raise venues.VenueError("no quote in the response")
                 mid, spread = compute_mid_spread(quote.bid, quote.ask)
                 print(
-                    f"{name:<10} {venue.to_symbol(symbol):<10} ok   bid={quote.bid:<12g} "
+                    f"{name:<10} {display:<10} ok   bid={quote.bid:<12g} "
                     f"ask={quote.ask:<12g} mid={mid:<12g} spread={spread:.2f}bps"
                 )
             except Exception as exc:  # noqa: BLE001 - report, never raise
                 failures += 1
                 detail = getattr(exc, "reason", None) or exc
                 print(
-                    f"{name:<10} {venue.to_symbol(symbol):<10} FAILED  "
+                    f"{name:<10} {display:<10} FAILED  "
                     f"{_describe(exc)}: {str(detail)[:80]}"
                 )
     if failures:
