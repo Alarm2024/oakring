@@ -334,7 +334,7 @@ Optional dry measurement: when `JUPITER_ENABLED=1`, the recorder fetches Jupiter
 Two layers are recorded:
 
 1. **Aggregated** — one best-route quote on the `ticks` row (`onchain_ref`, `basis_bps`), same as before.
-2. **Per-pool** — when `JUPITER_DEXES` is set, parallel quotes restricted to each DEX (Raydium, Orca, Meteora DLMM, …) land in the `pool_samples` child table. SOLUSDC pairs quote against USDC; SOLUSDT pairs quote against USDT automatically.
+2. **Per-pool** — when `JUPITER_DEXES` is set, quotes restricted to each DEX, fetched one at a time, (Raydium, Orca, Meteora DLMM, …) land in the `pool_samples` child table. SOLUSDC pairs quote against USDC; SOLUSDT pairs quote against USDT automatically.
 
 ```bash
 # in ~/.config/oakring/.env
