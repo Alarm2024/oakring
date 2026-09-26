@@ -102,6 +102,8 @@ python3 analyze.py --since 7d  --bucket 1h --format csv  > bars.csv
 | `--edge-bps` | `40` | \|basis\| at or above this for `--basis-min-ticks` counts as edge |
 | `--basis-min-ticks` | `3` | Minimum consecutive ticks for a held or edge period |
 | `--venues` | off | Compare each pair across the venues recording it, then exit |
+| `--follow` | off | Rank venue-pair dislocations that clear `--cost-bps` often and persistently, then exit |
+| `--cost-bps` | none | Required with `--follow`: your all-in cost floor in bps |
 | `--venue` | all | Restrict any command to one venue |
 | `--stale-after` | `5m` | In `--latest`, flag a pair whose last tick is older than this |
 | `--since` | `7d` | Window back from now (`90m`, `24h`, `7d`, `2w`) |
@@ -295,6 +297,8 @@ SOLUSDC  2026-09-15T17:39:00Z  (binance, coinbase, kraken, okx)
 ```
 
 `gap` is how far apart the mids are. `crossed` is the best bid anywhere minus the best ask anywhere — positive means one venue's bid sits above another's ask.
+
+**Ranking where to look.** `--follow --cost-bps 30 --since 7d` scores every venue pair recording the same market: how often the mid-to-mid gap cleared your all-in cost floor, how long those clearing runs lasted, and which hours of the day they happen in. A venue pair with fewer than 100 simultaneous ticks in the window is listed as INSUFFICIENT rather than ranked. The crossed-book caveat below applies doubly here: this ranks where to look, not what to earn.
 
 Only ticks where every venue priced are compared, since a fresh book against a missing one would invent a gap that was never there. All venues in a round share one timestamp, so these are simultaneous quotes.
 
