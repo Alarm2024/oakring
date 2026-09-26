@@ -132,8 +132,8 @@ To confirm everything is recording, compare the hourly tick count in `./check.sh
 
 ```
 === SOLUSDT ===
-window 2026-08-30T19:27:54Z -> 2026-09-14T19:27:54Z  bucket 1.0h
-coverage   336/360 bars (93.3% of the window, 100.0% of what was recorded), 336 ticks, 0 errored (0.0%), 0 gaps
+window 2026-08-30T19:27:54Z -> 2026-09-14T19:27:54Z  bucket 1.0h  swing 2.0%
+coverage   336/360 bars (93.3% of the window, 100.0% of what was recorded), 336 ticks, 0 errored (0.0%), 0 gaps (largest 0 bars)
 price      100.0000 -> 106.0474 (+6.05%)  range 95.7200..111.0000 (15.96%)
            high 2026-09-13T07:00:00Z, low 2026-09-02T07:00:00Z, now -4.46% from high / +10.79% from low
            spread avg 2.00 bps (max 2.00), book imbalance +0.500
