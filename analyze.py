@@ -1716,13 +1716,13 @@ def render_basis(reports: list[dict]) -> str:
             last = cross["last"]
             stats = cross["stats"]
             lines.append(
-                f"  cross-pool {last['spread_bps']:+.2f} bps now  "
-                f"buy {last['best_buy_dex']}@{price_fmt(last['best_buy_ref'])}  "
-                f"sell {last['best_sell_dex']}@{price_fmt(last['best_sell_ref'])}  "
-                f"({last['pool_count']} pools)"
+                f"  cross-pool gap {last['spread_bps']:+.2f} bps now  "
+                f"lowest {last['best_buy_dex']}@{price_fmt(last['best_buy_ref'])}  "
+                f"highest {last['best_sell_dex']}@{price_fmt(last['best_sell_ref'])}  "
+                f"({last['pool_count']} pools, sell quotes)"
             )
             lines.append(
-                f"             mean spread {stats['mean_spread_bps']:+.2f} bps  "
+                f"             mean gap {stats['mean_spread_bps']:+.2f} bps  "
                 f"max {stats['max_spread_bps']:+.2f} bps over {cross['ticks']} ticks"
             )
 
@@ -1733,8 +1733,12 @@ def render_basis(reports: list[dict]) -> str:
     if any(not report.get("status") or report.get("pools") for report in reports):
         lines.append("Basis is (cex_mid - pool_ref) / pool_ref per leg. Per-pool refs come from")
         lines.append("parallel Jupiter quotes (JUPITER_DEXES) on the same tick as the CEX book.")
-        lines.append("Cross-pool spread is best_sell_pool minus best_buy_pool. No fees, latency or")
-        lines.append("execution path are counted — dry measurement for eyes, not send.")
+        lines.append("Every pool ref is a sell quote (SOL in, stablecoin out, JUPITER_AMOUNT_LAMPORTS,")
+        lines.append("1 SOL by default), so each pool's own fee and price impact are already taken off.")
+        lines.append("The cross-pool gap is highest sell quote minus lowest sell quote: it mostly")
+        lines.append("measures fee tiers. It is not a buy-here, sell-there gap, because buying SOL")
+        lines.append("on the lowest pool costs its ask, which is not quoted. Latency and the")
+        lines.append("execution path are not counted. Dry measurement for eyes, not send.")
     return "\n".join(lines).rstrip()
 
 
