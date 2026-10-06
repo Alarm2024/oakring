@@ -11,7 +11,7 @@ All endpoints are public: no keys, no accounts, read-only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 # Longest first, so SOLUSDC splits at USDC and not at USD.
@@ -28,6 +28,10 @@ class Quote:
     ask: float
     bid_qty: float
     ask_qty: float
+    # Wall-clock ms when this venue's response arrived. Two venues are only
+    # comparable when these are close; the round's shared timestamp says when
+    # the round started, not when each book was read.
+    fetched_ms: int | None = field(default=None, compare=False)
 
 
 def split_pair(pair: str) -> tuple[str, str]:

@@ -38,6 +38,7 @@ EXPECTED_COLUMNS: dict[str, str] = {
     "onchain_impact_bps": "REAL",
     "basis_bps": "REAL",
     "onchain_note": "TEXT",
+    "fetched_ms": "INTEGER",
 }
 
 

@@ -10,6 +10,7 @@ visible to the analyzer instead of silently disappearing.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import signal
@@ -67,11 +68,12 @@ def fetch_venue(venue: venues.Venue, pairs: dict[str, str], timeout: int) -> dic
             break
         symbols = [venue.to_symbol(pairs[name]) for name in group]
         payload = http_get_json(venue.build_url(venue.base_url, symbols), timeout)
+        arrived_ms = int(time.time() * 1000)
         parsed = venue.parse(payload, symbols[0])
         for name, symbol in zip(group, symbols):
             quote = parsed.get(symbol) or parsed.get(pairs[name].upper())
             if quote is not None:
-                quotes[name] = quote
+                quotes[name] = replace(quote, fetched_ms=arrived_ms)
     return quotes
 
 
@@ -150,27 +152,26 @@ def row_from_quote(
     if quote is None:
         return (
             ts, epoch, pair, source, None, None, None, None, None, None,
-            fallback_note or "error:Missing", onchain_ref, onchain_impact, None, onchain_note,
+            fallback_note or "error:Missing", onchain_ref, onchain_impact, None, onchain_note, None,
         )
     if quote.bid <= 0 or quote.ask <= 0 or quote.ask < quote.bid:
         return (
             ts, epoch, pair, source, quote.bid, quote.ask, None, None,
             quote.bid_qty, quote.ask_qty, "error:CrossedBook",
-            onchain_ref, onchain_impact, None, onchain_note,
+            onchain_ref, onchain_impact, None, onchain_note, quote.fetched_ms,
         )
     mid, spread_bps = compute_mid_spread(quote.bid, quote.ask)
     basis_bps = compute_basis_bps(mid, onchain_ref)
     return (
         ts, epoch, pair, source, quote.bid, quote.ask, mid, spread_bps,
         quote.bid_qty, quote.ask_qty, None, onchain_ref, onchain_impact, basis_bps, onchain_note,
+        quote.fetched_ms,
     )
 
 
 def _pad_row(row: tuple) -> tuple:
-    """Older callers wrote 11 columns; on-chain fields default to NULL."""
-    if len(row) == 11:
-        return row + (None, None, None, None)
-    return row
+    """Older callers wrote 11 or 15 columns; missing fields default to NULL."""
+    return row + (None,) * (16 - len(row))
 
 
 def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
@@ -179,8 +180,8 @@ def insert_rows(conn: sqlite3.Connection, rows: list[tuple]) -> None:
         """
         INSERT INTO ticks
             (ts_utc, ts_epoch, pair, source, bid, ask, mid, spread_bps, bid_qty, ask_qty, note,
-             onchain_ref, onchain_impact_bps, basis_bps, onchain_note)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             onchain_ref, onchain_impact_bps, basis_bps, onchain_note, fetched_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
@@ -304,26 +305,41 @@ def run_tick(
     max_retries: int,
     jupiter_cfg: dict[str, object] | None = None,
 ) -> None:
-    """One round across every venue, all stamped with the same timestamp.
+    """One round across every venue, stamped with the round's timestamp.
 
-    The shared timestamp is what makes cross-venue and cross-pair comparison
-    exact later: every leg of a comparison comes from the same instant.
+    **Every venue is asked at once.** The round used to ask Jupiter, then each
+    venue in turn, and stamp them all with the round's start: books read
+    seconds apart were compared as one instant, so a price that moved between
+    two requests showed as a crossed book. Each quote now also carries the
+    time its response arrived (`fetched_ms`), and the analyzer compares two
+    books only when those are close.
     """
     moment = common.now_utc()
     ts, epoch = common.to_ts_utc(moment), common.to_epoch(moment)
     rows: list[tuple] = []
     jupiter_cfg = jupiter_cfg or {"enabled": False}
-    onchain_quote, onchain_error = fetch_jupiter_quote(jupiter_cfg, timeout)
     attach_pairs = jupiter_cfg.get("attach_pairs") or set()
 
-    for name, pairs in watchlists.items():
+    known: dict[str, venues.Venue] = {}
+    for name in watchlists:
         try:
-            venue = venues.get(name)
+            known[name] = venues.get(name)
         except venues.VenueError as exc:
             logging.error("%s", exc)
-            continue
 
-        quotes, error = fetch_with_retries(venue, pairs, timeout, max_retries)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(known) + 1) as pool:
+        onchain_future = pool.submit(fetch_jupiter_quote, jupiter_cfg, timeout)
+        futures = {
+            name: pool.submit(fetch_with_retries, venue, watchlists[name], timeout, max_retries)
+            for name, venue in known.items()
+        }
+        onchain_quote, onchain_error = onchain_future.result()
+        fetched = {name: future.result() for name, future in futures.items()}
+
+    for name, pairs in watchlists.items():
+        if name not in fetched:
+            continue
+        quotes, error = fetched[name]
         for pair in pairs:
             onchain = onchain_quote if pair in attach_pairs else None
             onchain_note = onchain_error if pair in attach_pairs else None

@@ -286,8 +286,20 @@ class VenueComparisonTests(unittest.TestCase):
             os.environ["OAKRING_CONFIG_DIR"] = self._previous
         self._tmp.cleanup()
 
-    def seed(self, books: dict[str, tuple[float, float]], ticks: int = 5, skip: str = "") -> int:
-        """books: venue -> (bid, ask), repeated for `ticks` rounds."""
+    def seed(
+        self,
+        books: dict[str, tuple[float, float]],
+        ticks: int = 5,
+        skip: str = "",
+        arrived_ms: dict[str, int] | None = None,
+        timed: bool = True,
+    ) -> int:
+        """books: venue -> (bid, ask), repeated for `ticks` rounds.
+
+        Each venue's response arrives `arrived_ms[venue]` ms into the round (0 by
+        default); `timed=False` writes rows the way the recorder did before it
+        kept arrival times.
+        """
         conn = common.connect(self.db_path)
         now = common.to_epoch(common.now_utc())
         now -= now % 60
@@ -299,8 +311,10 @@ class VenueComparisonTests(unittest.TestCase):
                 if venue == skip and index == ticks - 1:
                     continue  # this venue missed the final round
                 mid = (bid + ask) / 2
+                fetched = epoch * 1000 + (arrived_ms or {}).get(venue, 0) if timed else None
                 rows.append((ts, epoch, "SOLUSDC", venue, bid, ask, mid,
-                             (ask - bid) / mid * 10000, 5.0, 5.0, None))
+                             (ask - bid) / mid * 10000, 5.0, 5.0, None,
+                             None, None, None, None, fetched))
         recorder.insert_rows(conn, rows)
         conn.close()
         return now
@@ -320,6 +334,59 @@ class VenueComparisonTests(unittest.TestCase):
         # kraken's bid (100.10) sits above binance's ask (100.02): a crossed book
         self.assertGreater(report["last"]["cross_bps"], 0)
         self.assertEqual(report["crossed_pct"], 100.0)
+
+    def test_books_read_far_apart_are_not_called_crossed(self) -> None:
+        """Kraken answering 2 s after Binance is two moments, not one crossed book."""
+        self.seed({"binance": (100.00, 100.02), "kraken": (100.10, 100.14)}, arrived_ms={"kraken": 2000})
+        conn = common.connect(self.db_path, read_only=True)
+        now = common.to_epoch(common.now_utc())
+        report = analyze.venue_report(conn, "SOLUSDC", now - 3600, now)
+        conn.close()
+        self.assertEqual(report["too_far_apart_ticks"], 5)
+        self.assertIsNone(report["crossed_pct"], "nothing was read close enough together to measure")
+        self.assertEqual(report["skew_median_ms"], 2000)
+
+    def test_rows_without_arrival_times_are_not_measured(self) -> None:
+        self.seed({"binance": (100.00, 100.02), "kraken": (100.10, 100.14)}, timed=False)
+        conn = common.connect(self.db_path, read_only=True)
+        now = common.to_epoch(common.now_utc())
+        report = analyze.venue_report(conn, "SOLUSDC", now - 3600, now)
+        conn.close()
+        self.assertEqual(report["untimed_ticks"], 5)
+        self.assertIsNone(report["crossed_pct"])
+        self.assertIn("crossed books: not measured", analyze.render_venues([report]))
+
+    def test_the_skew_limit_is_the_callers(self) -> None:
+        self.seed({"binance": (100.00, 100.02), "kraken": (100.10, 100.14)}, arrived_ms={"kraken": 300})
+        conn = common.connect(self.db_path, read_only=True)
+        now = common.to_epoch(common.now_utc())
+        loose = analyze.venue_report(conn, "SOLUSDC", now - 3600, now)
+        strict = analyze.venue_report(conn, "SOLUSDC", now - 3600, now, max_skew_ms=100)
+        conn.close()
+        self.assertEqual(loose["crossed_pct"], 100.0)
+        self.assertIsNone(strict["crossed_pct"])
+
+    def test_a_database_from_before_arrival_times_still_reads(self) -> None:
+        """The analyzer opens read-only; an unmigrated file has no fetched_ms column."""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "CREATE TABLE ticks (id INTEGER PRIMARY KEY, ts_utc TEXT, ts_epoch INTEGER, pair TEXT, "
+            "source TEXT, bid REAL, ask REAL, mid REAL, spread_bps REAL, bid_qty REAL, ask_qty REAL, note TEXT)"
+        )
+        now = common.to_epoch(common.now_utc()) - 60
+        for venue, (bid, ask) in {"binance": (100.0, 100.02), "kraken": (100.1, 100.14)}.items():
+            conn.execute(
+                "INSERT INTO ticks (ts_utc, ts_epoch, pair, source, bid, ask, mid, spread_bps, note) "
+                "VALUES (?, ?, 'SOLUSDC', ?, ?, ?, ?, 1.0, NULL)",
+                (common.to_ts_utc(common.from_epoch(now)), now, venue, bid, ask, (bid + ask) / 2),
+            )
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        series = analyze.venue_series(conn, "SOLUSDC", now - 3600, now + 60)
+        conn.close()
+        self.assertEqual(len(series), 1)
+        self.assertIsNone(series[0]["skew_ms"])
 
     def test_venues_that_agree_show_no_cross(self) -> None:
         self.seed({"binance": (100.00, 100.02), "okx": (100.00, 100.02)})

@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS ticks (
     onchain_ref REAL,
     onchain_impact_bps REAL,
     basis_bps REAL,
-    onchain_note TEXT
+    onchain_note TEXT,
+    -- wall-clock ms when this venue's response arrived (NULL before it was recorded)
+    fetched_ms INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_ticks_pair_ts ON ticks (pair, ts_utc);
