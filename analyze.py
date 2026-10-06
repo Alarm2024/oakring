@@ -34,6 +34,10 @@ MIN_BARS_FOR_STATS = 5
 TARGET_BARS = 150  # what --auto aims for: enough to see a cycle, few enough to stay readable
 BUCKET_LADDER = (60, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200, 86400)
 MIN_FOLLOW_TICKS = 100  # fewer simultaneous ticks than this are INSUFFICIENT for ranking
+# Two books are compared as one instant only when their responses arrived
+# within this many ms of each other. SOL moves a cent in well under a second,
+# and a cent is 0.8 bps at $120, so books read further apart cross by drift.
+MAX_SKEW_MS = 500
 
 # Legacy rows written before ts_epoch existed still carry a usable ts_utc.
 EPOCH_SQL = "COALESCE(NULLIF(ts_epoch, 0), CAST(strftime('%s', ts_utc) AS INTEGER))"
@@ -401,12 +405,16 @@ def render_cross(reports: list[dict]) -> str:
 def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
     """Per tick, every venue's book for one pair - only ticks all of them priced.
 
-    The recorder stamps every venue in a round with one timestamp, so these are
-    simultaneous quotes rather than a stale book compared against a fresh one.
+    The rows of one tick share the round's timestamp, which is when the round
+    started, not when each book was read. `skew_ms` is how far apart the books'
+    responses arrived; None for rows recorded before arrival times were kept,
+    when venues were asked one after another and could be seconds apart.
     """
+    has_fetched = "fetched_ms" in {row[1] for row in conn.execute("PRAGMA table_info(ticks)")}
+    fetched_col = "fetched_ms" if has_fetched else "NULL AS fetched_ms"
     rows = conn.execute(
         f"""
-        SELECT {EPOCH_SQL} AS epoch, source, bid, ask, mid
+        SELECT {EPOCH_SQL} AS epoch, source, bid, ask, mid, {fetched_col}
         FROM ticks
         WHERE pair = ? AND note IS NULL AND mid IS NOT NULL
           AND {EPOCH_SQL} BETWEEN ? AND ?
@@ -418,7 +426,8 @@ def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
     by_epoch: dict[int, dict[str, dict]] = {}
     for row in rows:
         by_epoch.setdefault(int(row["epoch"]), {})[row["source"]] = {
-            "bid": float(row["bid"]), "ask": float(row["ask"]), "mid": float(row["mid"])
+            "bid": float(row["bid"]), "ask": float(row["ask"]), "mid": float(row["mid"]),
+            "fetched_ms": None if row["fetched_ms"] is None else int(row["fetched_ms"]),
         }
 
     sources = {source for books in by_epoch.values() for source in books}
@@ -435,8 +444,11 @@ def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
         mids = {name: book["mid"] for name, book in books.items()}
         cheapest, dearest = min(mids, key=mids.get), max(mids, key=mids.get)
         reference = statistics.fmean(mids.values())
+        arrivals = [book["fetched_ms"] for book in books.values()]
+        skew_ms = None if None in arrivals else max(arrivals) - min(arrivals)
         series.append({
             "epoch": epoch,
+            "skew_ms": skew_ms,
             "books": books,
             "best_bid_venue": best_bid_venue,
             "best_ask_venue": best_ask_venue,
@@ -449,15 +461,23 @@ def venue_series(conn, pair: str, start: int, end: int) -> list[dict]:
     return series
 
 
-def venue_report(conn, pair: str, start: int, end: int) -> dict:
+def venue_report(conn, pair: str, start: int, end: int, max_skew_ms: int = MAX_SKEW_MS) -> dict:
     series = venue_series(conn, pair, start, end)
     if not series:
         return {"pair": pair, "status": "needs two venues priced in the same tick"}
 
-    spreads = [point["spread_bps"] for point in series]
-    crossed = [point for point in series if point["cross_bps"] > 0]
-    widest = max(series, key=lambda point: point["spread_bps"])
+    # Only books read close together are one instant. Older rows carry no
+    # arrival time: those venues were asked one after another, and a price
+    # that moved between two requests reads as a crossed book that never was.
+    untimed = [point for point in series if point["skew_ms"] is None]
+    too_far = [point for point in series if point["skew_ms"] is not None and point["skew_ms"] > max_skew_ms]
+    timed = [point for point in series if point["skew_ms"] is not None and point["skew_ms"] <= max_skew_ms]
+    measured = timed or series
+    spreads = [point["spread_bps"] for point in measured]
+    crossed = [point for point in timed if point["cross_bps"] > 0]
+    widest = max(measured, key=lambda point: point["spread_bps"])
     last = series[-1]
+    skews = sorted(point["skew_ms"] for point in series if point["skew_ms"] is not None)
 
     return {
         "pair": pair,
@@ -477,8 +497,15 @@ def venue_report(conn, pair: str, start: int, end: int) -> dict:
         "spread_mean_bps": round(statistics.fmean(spreads), 3),
         "spread_max_bps": round(widest["spread_bps"], 3),
         "spread_max_at": common.to_ts_utc(common.from_epoch(widest["epoch"])),
+        "gap_from_timed": bool(timed),
+        "max_skew_ms": max_skew_ms,
+        "timed_ticks": len(timed),
+        "untimed_ticks": len(untimed),
+        "too_far_apart_ticks": len(too_far),
+        "skew_median_ms": statistics.median(skews) if skews else None,
         "crossed_ticks": len(crossed),
-        "crossed_pct": round(100.0 * len(crossed) / len(series), 2),
+        # None, not 0: with no books read close together, nothing was measured.
+        "crossed_pct": round(100.0 * len(crossed) / len(timed), 2) if timed else None,
         "crossed_max_bps": round(max((point["cross_bps"] for point in crossed), default=0.0), 3),
     }
 
@@ -506,14 +533,33 @@ def render_venues(reports: list[dict]) -> str:
             f"  crossed  {last['cross_bps']:+.2f} bps now "
             f"(best bid {last['best_bid_venue']}, best ask {last['best_ask_venue']})"
         )
+        basis = (
+            f"{report['timed_ticks']} ticks read within {report['max_skew_ms']} ms"
+            if report["gap_from_timed"]
+            else f"{report['ticks']} ticks, venues read one after another"
+        )
         lines.append(
-            f"  over {report['span_human']}: mean gap {report['spread_mean_bps']:.2f}, "
+            f"  over {report['span_human']} ({basis}): mean gap {report['spread_mean_bps']:.2f}, "
             f"widest {report['spread_max_bps']:.2f} bps at {report['spread_max_at']}"
         )
-        lines.append(
-            f"  books crossed in {report['crossed_pct']}% of {report['ticks']} "
-            f"simultaneous ticks, at most {report['crossed_max_bps']:+.2f} bps"
-        )
+        if report["crossed_pct"] is None:
+            lines.append(
+                f"  crossed books: not measured. These {report['untimed_ticks']} ticks were read one venue "
+                "after another, seconds apart, so drift between requests looks like a cross."
+            )
+        else:
+            lines.append(
+                f"  books crossed in {report['crossed_pct']}% of {report['timed_ticks']} ticks read within "
+                f"{report['max_skew_ms']} ms of each other, at most {report['crossed_max_bps']:+.2f} bps"
+            )
+        if report["skew_median_ms"] is not None:
+            lines.append(f"  read apart: median {report['skew_median_ms']:.0f} ms across venues")
+        skipped = report["untimed_ticks"] + report["too_far_apart_ticks"]
+        if report["crossed_pct"] is not None and skipped:
+            lines.append(
+                f"  not compared: {report['untimed_ticks']} ticks without arrival times, "
+                f"{report['too_far_apart_ticks']} read more than {report['max_skew_ms']} ms apart"
+            )
     if any("status" not in report for report in reports):
         lines.append("")
         lines.append("A crossed book across venues is not free money: taker fees, withdrawal")
@@ -1729,6 +1775,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="rank venue-pair dislocations that clear --cost-bps often and persistently, then exit",
     )
     parser.add_argument(
+        "--max-skew-ms",
+        type=int,
+        default=MAX_SKEW_MS,
+        help=f"--venues: compare two books only when they arrived within this many ms (default: {MAX_SKEW_MS})",
+    )
+    parser.add_argument(
         "--cost-bps",
         type=float,
         default=None,
@@ -1817,7 +1869,9 @@ def main(argv: list[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            reports = [venue_report(conn, pair, end_epoch - since_sec, end_epoch) for pair in multi]
+            reports = [
+                venue_report(conn, pair, end_epoch - since_sec, end_epoch, args.max_skew_ms) for pair in multi
+            ]
             if args.format == "json":
                 print(json.dumps({"venues": reports}, indent=2))
             else:

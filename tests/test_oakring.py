@@ -209,6 +209,38 @@ class RecorderLoopTests(TempConfigCase):
         self.assertTrue(all(row["note"] is None for row in rows))
         conn.close()
 
+    def test_every_venue_is_asked_at_once_and_arrival_is_kept(self) -> None:
+        """Venues asked one after another were read seconds apart."""
+        import time as _time
+        started: list[float] = []
+
+        def slow_get(url: str, timeout: int) -> object:
+            started.append(_time.monotonic())
+            _time.sleep(0.3)
+            if "okx" in url:
+                return {"data": [{"instId": "SOL-USDC", "bidPx": "100", "askPx": "100.1", "bidSz": "1", "askSz": "1"}]}
+            return [{"symbol": "SOLUSDC", "bidPrice": "100", "askPrice": "100.1", "bidQty": "2", "askQty": "2"}]
+
+        original, recorder.http_get_json = recorder.http_get_json, slow_get
+        saved = {name: venues.VENUES[name] for name in ("binance", "okx")}
+        try:
+            conn = common.connect(self.db_path)
+            venues.VENUES["binance"] = dataclasses.replace(saved["binance"], base_url="https://binance.example.test")
+            venues.VENUES["okx"] = dataclasses.replace(saved["okx"], base_url="https://okx.example.test")
+            recorder.run_tick(conn, {"binance": {"SOLUSDC": "SOLUSDC"}, "okx": {"SOLUSDC": "SOLUSDC"}}, 5, 0)
+        finally:
+            recorder.http_get_json = original
+            venues.VENUES.update(saved)
+
+        self.assertEqual(len(started), 2)
+        self.assertLess(abs(started[0] - started[1]), 0.2, "both venues must be asked together")
+        rows = conn.execute("SELECT source, fetched_ms FROM ticks ORDER BY source").fetchall()
+        self.assertEqual([row["source"] for row in rows], ["binance", "okx"])
+        arrivals = [row["fetched_ms"] for row in rows]
+        self.assertTrue(all(isinstance(value, int) for value in arrivals))
+        self.assertLess(abs(arrivals[0] - arrivals[1]), 200)
+        conn.close()
+
     def test_failed_fetch_still_records_the_gap(self) -> None:
         def always_fails(url: str, timeout: int) -> object:
             raise OSError("no network")
