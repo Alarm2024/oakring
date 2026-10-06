@@ -273,6 +273,15 @@ class BasisAnalysisTests(TempConfigCase):
         self.assertEqual(report["cross_pool"]["last"]["best_buy_dex"], "Raydium")
         self.assertEqual(report["cross_pool"]["last"]["best_sell_dex"], "Orca")
 
+        # Both refs are sell quotes, so the text must not read as a buy-here, sell-there trade.
+        text = analyze.render_basis([report])
+        self.assertIn("cross-pool gap", text)
+        self.assertIn("lowest Raydium@", text)
+        self.assertIn("highest Orca@", text)
+        self.assertIn("sell quotes", text)
+        self.assertNotIn("buy Raydium", text)
+        self.assertNotIn("No fees", text)
+
     def test_basis_cli(self) -> None:
         self.seed_basis_ticks()
         buffer = io.StringIO()

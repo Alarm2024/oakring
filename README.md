@@ -348,7 +348,7 @@ python3 analyze.py --basis --since 12h
 python3 analyze.py --basis --since 2h --held-bps 15 --edge-bps 40 --format json
 ```
 
-`basis_bps = (cex_mid - pool_ref) / pool_ref * 10000` per leg. `--basis` reports aggregated and **per-pool** held/edge periods, plus **cross-pool spread** (cheapest pool vs dearest pool on the same tick — same-pool vs cross-pool visibility). No swap is built, no wallet is touched, and no API key is required for the public quote endpoint unless your deployment needs one via `JUPITER_API_KEY`.
+`basis_bps = (cex_mid - pool_ref) / pool_ref * 10000` per leg. `--basis` reports aggregated and **per-pool** held/edge periods, plus the **cross-pool gap** (lowest vs highest pool sell quote on the same tick). Every pool ref is a sell quote with that pool's fee and impact already taken off, so the gap mostly measures fee tiers; it is not a buy-here, sell-there spread, because the low pool's ask is not quoted. No swap is built, no wallet is touched, and no API key is required for the public quote endpoint unless your deployment needs one via `JUPITER_API_KEY`.
 
 **This is eyes, not send.** Route impact, latency, fees and execution path are not counted — the same caveat as `--cross`.
 
